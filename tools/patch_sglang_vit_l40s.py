@@ -34,6 +34,61 @@ RUNNER_MARKER = "# [TRACK2-L40S-VIT-GRAPH]"
 def patch_vision_py(src: str) -> str:
     if VISION_MARKER in src:
         return src
+    # 1) Inject optional K2 native BF16 CUDA sm_89 fused QKV+RMSNorm+RoPE->SDPA fast path into VisionAttention.forward
+    target_attn = """        if self.use_qkv_parallel:
+            # [b, s, embed_dim] --> [b, s, embed_dim]
+            qkv, _ = self.qkv_proj(x)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)"""
+    repl_attn = """        # [TRACK2-K2-VIS-QKV-CUDA] Fused BF16 QKV split + Q/K RMSNorm + 2D NeoX RoPE -> [1, H, S, 64] SDPA
+        if (
+            self.use_qkv_parallel
+            and self.qk_normalization_by_head_size
+            and self.head_size == 64
+            and bsz == 1
+            and isinstance(cu_seqlens, list)
+            and cu_seqlens[0].numel() == 2
+            and rotary_pos_emb_cos is not None
+            and rotary_pos_emb_sin is not None
+            and rotary_pos_emb_cos.size(-1) == 64
+            and position_embeddings is None
+            and x.dtype == torch.bfloat16
+            and __import__("os").environ.get("TRACK2_VIS_QKV_CUDA", "1") == "1"
+        ):
+            _k2_fn = getattr(self, "_track2_vis_qkv_fn", None)
+            if _k2_fn is None:
+                try:
+                    from gravity_ocr import cuda_sm89 as _t2_cuda
+                    _k2_fn = _t2_cuda.vis_qkv_sdpa_bf16 if _t2_cuda.available() else False
+                    if _k2_fn and not getattr(VisionAttention, "_track2_k2_logged", False):
+                        VisionAttention._track2_k2_logged = True
+                        print("[track2-k2-vis-qkv] ON: fused BF16 CUDA sm_89 QKV+RMSNorm+RoPE->SDPA", flush=True)
+                except Exception:
+                    _k2_fn = False
+                self._track2_vis_qkv_fn = _k2_fn
+            if _k2_fn:
+                qkv, _ = self.qkv_proj(x)
+                q4, k4, v4 = _k2_fn(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    float(self.q_norm.variance_epsilon),
+                    head,
+                )
+                out4 = F.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+                output = out4.squeeze(0).transpose(0, 1).reshape(1, s, head * 64)
+                output, _ = self.proj(output)
+                return output
+
+        if self.use_qkv_parallel:
+            # [b, s, embed_dim] --> [b, s, embed_dim]
+            qkv, _ = self.qkv_proj(x)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)"""
+    if target_attn not in src:
+        raise RuntimeError("Could not locate VisionAttention.forward qkv_proj block in vision.py")
+    src = src.replace(target_attn, repl_attn, 1)
+
     target = """        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")

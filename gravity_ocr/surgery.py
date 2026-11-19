@@ -48,7 +48,7 @@ BUDGET = 16_384
 CJK_FILL = 1_024  # the most frequent Hanja
 
 CAPS_PIECE = re.compile(rb" ?[A-Z0-9]+")
-TEXT_PUNCT = re.compile(rb"[0-9 \n.,:;\-/()%+=#&*'\"!?]+")
+TEXT_PUNCT = re.compile(rb"[0-9 \n\t.,:;\-/()%+=#&*'\"!?{}\\\^_$<>\[\]|~`]+")
 WORD_PIECE = re.compile(rb" ?[A-Za-z]+")
 HTML_RE = re.compile(r"</?(table|thead|tbody|tr|td|th|br|caption)\b|^\s*/?>\s*$")
 
@@ -302,3 +302,14 @@ def build_task_slices(
     f_ids = np.array(sorted(keep), dtype=np.int64)
     formula_slice = Slice(f_ids, tiers, {})
     return {"table": table_slice, "text": text_slice, "formula": formula_slice}
+
+
+def build_universal_slice(
+    vocab: Vocab,
+    extra: list[str] | None = None,
+    budget: int = BUDGET,
+    cjk_fill: int = CJK_FILL,
+) -> Slice:
+    """Build a single 16,384-row Byte-BPE Safe universal slice covering table, text, and formula."""
+    corpus = domain_corpus() + TABLE_SEEDS + FORMULA_SEEDS + list(extra or [])
+    return build(vocab, corpus, budget=budget, cjk_fill=cjk_fill)
