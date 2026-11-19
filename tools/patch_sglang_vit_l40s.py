@@ -64,6 +64,56 @@ def patch_vision_py(src: str) -> str:
                 except Exception:
                     _k2_fn = False
                 self._track2_vis_qkv_fn = _k2_fn
+            _k2_ip = getattr(self, "_track2_k2_inplace", None)
+            if _k2_ip is None:
+                _k2_ip = False
+                try:
+                    from gravity_ocr import cuda_sm89 as _t2_cuda
+                    if __import__("os").environ.get("TRACK2_K2_INPLACE", "1") == "1" and _t2_cuda.fused_available():
+                        _k2_ip = _t2_cuda.vis_qk_norm_rope_inplace
+                        if not getattr(VisionAttention, "_track2_k2ip_logged", False):
+                            VisionAttention._track2_k2ip_logged = True
+                            print("[track2-k2-vis-qkv] in place: q/k norm + RoPE inside qkv, strided q/k/v views", flush=True)
+                except Exception:
+                    _k2_ip = False
+                self._track2_k2_inplace = _k2_ip
+            if _k2_fn and _k2_ip and (cu_seqlens[0].numel() == 2 or (
+                _T2_FA2_VARLEN and type(self.qkv_backend).__name__ == "VisionTritonAttention")):
+                # [TRACK2-K2-INPLACE] same values as K2 (bitwise), no [S, H, 64] q / k / v copies
+                qkv, _ = self.qkv_proj(x)
+                if not qkv.is_contiguous():
+                    qkv = qkv.contiguous()
+                q3, k3, v3 = _k2_ip(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    float(self.q_norm.variance_epsilon),
+                    head,
+                )
+                if cu_seqlens[0].numel() == 2:
+                    out4 = F.scaled_dot_product_attention(
+                        q3.transpose(0, 1).unsqueeze(0), k3.transpose(0, 1).unsqueeze(0), v3.transpose(0, 1).unsqueeze(0),
+                        is_causal=False,
+                    )
+                    output = out4.squeeze(0).transpose(0, 1).reshape(1, s, head * 64)
+                else:
+                    out3 = self.qkv_backend.forward(
+                        q=q3,
+                        k=k3,
+                        v=v3,
+                        bsz=bsz,
+                        seq_len=s,
+                        cu_seqlens=cu_seqlens,
+                        attention_mask=attention_mask,
+                        sequence_lengths=sequence_lengths,
+                        max_seqlen=max_seqlen,
+                        output_ws=attn_output_ws,
+                    )
+                    output = out3.reshape(1, s, head * 64)
+                output, _ = self.proj(output)
+                return output
             if _k2_fn:
                 qkv, _ = self.qkv_proj(x)
                 if cu_seqlens[0].numel() == 2:
@@ -529,7 +579,13 @@ def _t2_get_cuda_sm89():
                 print("[ss-vit-graph] deferred: quantized ViT, graphs are captured at the first scheduler tick", flush=True)
             else:
                 self._ss_maybe_capture_vit_graphs()
-            self._t2_register_prefetch()"""
+            self._t2_register_prefetch()
+            try:
+                # v6 fused FP8 kernels (MLP silu*up+quant, fast M-RoPE); before any CUDA graph capture
+                from gravity_ocr import fused_fp8 as _t2_ff
+                _t2_ff.install()
+            except Exception as _e:
+                print(f"[track2-fused] OFF: {_e}", flush=True)"""
     if target_lw not in src:
         raise RuntimeError("Could not locate the ViT graph capture call in load_weights")
     return src.replace(target_lw, repl_lw, 1)

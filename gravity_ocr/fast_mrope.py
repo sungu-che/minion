@@ -4,6 +4,7 @@ SGLang's _triton_mrope_forward_fused runs one program per token and reads the ro
 (even / odd elements). Here a program rotates BLOCK_T tokens, loads every head row contiguously (16-byte vectors) and
 splits it into (even, odd) in registers with tl.split; the arithmetic is the same bf16 expressions as SGLang's kernel
 (cos / sin rows assembled from the t / h / w sections by masked loads + adds, then `e * cos - o * sin`, `o * cos + e * sin`),
+with SGLang's rounding pinned by explicit fma (its PTX: even = bf16(e*cos - bf16(o*sin)), odd = bf16(e*sin + bf16(o*cos))),
 so the result is bitwise equal (tools/test_fused_kernels.py mrope).
 
 Covers the configuration GLM-OCR uses: mrope_interleaved False, mrope_interleaved_glm False, is_neox_style False,
@@ -57,14 +58,20 @@ def _t2_mrope_kernel(
     qoff = toks[:, None, None].to(tl.int64) * q_stride + qh[None, :, None] * hd + d[None, None, :]
     xq = tl.load(q_ptr + qoff, mask=m3, other=0).to(sin_row.dtype)
     qe, qo = tl.split(tl.reshape(xq, (BT, n_qh, half, 2)))
-    yq = tl.reshape(tl.join(qe * c3 - qo * s3, qo * c3 + qe * s3), (BT, n_qh, hd))
+    cq = tl.broadcast_to(c3, (BT, n_qh, half))
+    sq = tl.broadcast_to(s3, (BT, n_qh, half))
+    # SGLang's kernel compiles `e * cos - o * sin` / `o * cos + e * sin` (bf16) to native bf16 FMAs with the e-product fused:
+    # even = bf16(e * cos - bf16(o * sin)), odd = bf16(e * sin + bf16(o * cos)); pinned here with explicit fma
+    yq = tl.reshape(tl.join(tl.fma(qe, cq, -(qo * sq)), tl.fma(qe, sq, qo * cq)), (BT, n_qh, hd))
     tl.store(q_ptr + qoff, yq, mask=m3)
 
     kh = tl.arange(0, n_kh)
     koff = toks[:, None, None].to(tl.int64) * k_stride + kh[None, :, None] * hd + d[None, None, :]
     xk = tl.load(k_ptr + koff, mask=m3, other=0).to(sin_row.dtype)
     ke, ko = tl.split(tl.reshape(xk, (BT, n_kh, half, 2)))
-    yk = tl.reshape(tl.join(ke * c3 - ko * s3, ko * c3 + ke * s3), (BT, n_kh, hd))
+    ck = tl.broadcast_to(c3, (BT, n_kh, half))
+    sk = tl.broadcast_to(s3, (BT, n_kh, half))
+    yk = tl.reshape(tl.join(tl.fma(ke, ck, -(ko * sk)), tl.fma(ke, sk, ko * ck)), (BT, n_kh, hd))
     tl.store(k_ptr + koff, yk, mask=m3)
 
 
