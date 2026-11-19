@@ -38,7 +38,9 @@ REL = {
     "ngram": "sglang/srt/speculative/ngram_info.py",
     "graph": "sglang/srt/model_executor/cuda_graph_runner.py",
     "scheduler": "sglang/srt/managers/scheduler.py",
+    "out_proc": "sglang/srt/managers/scheduler_output_processor_mixin.py",
     "fast_attn": "sglang/srt/speculative/selfspec_fast_attn.py",
+    "fast_commit": "sglang/srt/speculative/selfspec_fast_commit.py",
 }
 
 
@@ -69,9 +71,11 @@ def main() -> None:
         "ngram": lmh.patch_ngram_info(src("ngram")),
         "graph": lmh.patch_cuda_graph_runner(src("graph")),
         "fast_attn": msk.patch_fast_attn(src("fast_attn")),
+        "fast_commit": msk.patch_fast_commit(src("fast_commit")),
     }
     if not args.no_scheduler:
         files["scheduler"] = sch.patch_scheduler(src("scheduler"))
+        files["out_proc"] = sch.patch_output_processor(src("out_proc"))
     for key, text in files.items():
         dst = out / REL[key]
         dst.parent.mkdir(parents=True, exist_ok=True)

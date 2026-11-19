@@ -114,6 +114,9 @@ def patch_vision_py(src: str) -> str:
                         output_ws=attn_output_ws,
                     )
                     output = out3.reshape(1, s, head * 64)
+                if getattr(self, "_t2_f16_proj", False) and output.is_contiguous():
+                    _q8, _sc = self._t2_cuda_mod.quant_fp8_rows(output.view(s, -1), qnt_mode=3)
+                    return self._t2_f16_mm(_q8, self.proj.weight, _sc, self.proj.weight_scale, output.dtype, self.proj.bias).view(1, s, -1)
                 output, _ = self.proj(output)
                 return output
             if _k2_fn:
@@ -157,6 +160,9 @@ def patch_vision_py(src: str) -> str:
                         output_ws=attn_output_ws,
                     )
                     output = out3.reshape(1, s, head * 64)
+                if getattr(self, "_t2_f16_proj", False) and output.is_contiguous():
+                    _q8, _sc = self._t2_cuda_mod.quant_fp8_rows(output.view(s, -1), qnt_mode=3)
+                    return self._t2_f16_mm(_q8, self.proj.weight, _sc, self.proj.weight_scale, output.dtype, self.proj.bias).view(1, s, -1)
                 output, _ = self.proj(output)
                 return output
 
@@ -322,11 +328,11 @@ def patch_runner_py(src: str) -> str:
         cu = torch.cat([cu.new_zeros(1), cu])
         seq_lens = cu[1:] - cu[:-1]
         max_seqlen = int(seq_lens.max())
-        # [TRACK2-PINNED-H2D] page-locked sources: async copies (a pageable one blocks the host until this stream drains)
-        cu_gpu = cu.pin_memory().to(vis.device, non_blocking=True)
+        # [TRACK2-PINNED-H2D] reusable pinned staging ring (no per-batch cudaHostAlloc on the scheduler thread)
+        cu_gpu = _t2_h2d_i32(cu, vis.device)
         if cu.numel() == 2:
             return self._body(x, [cu_gpu, max_seqlen], cos, sin)
-        return self._body(x, [cu_gpu, seq_lens.pin_memory().to(vis.device, non_blocking=True), max_seqlen], cos, sin)"""
+        return self._body(x, [cu_gpu, _t2_h2d_i32(seq_lens, vis.device), max_seqlen], cos, sin)"""
     if target_eager not in src:
         raise RuntimeError("Could not locate _eager_list in glm_vit_graph_runner.py")
     src = src.replace(target_eager, repl_eager, 1)
@@ -339,6 +345,23 @@ _T2_POS_CACHE = {}
 _T2_POS_PIN_RING = []
 _T2_POS_PIN_IDX = 0
 _T2_POS_PIN_CAP = 65536
+_T2_I32_PIN_RING = []
+_T2_I32_PIN_IDX = 0
+_T2_I32_PIN_CAP = 512
+
+
+def _t2_h2d_i32(t: torch.Tensor, device) -> torch.Tensor:
+    global _T2_I32_PIN_IDX
+    n = int(t.numel())
+    if n <= _T2_I32_PIN_CAP:
+        if not _T2_I32_PIN_RING:
+            for _ in range(8):
+                _T2_I32_PIN_RING.append(torch.empty((_T2_I32_PIN_CAP,), dtype=torch.int32, pin_memory=True))
+        buf = _T2_I32_PIN_RING[_T2_I32_PIN_IDX & 7]
+        _T2_I32_PIN_IDX += 1
+        buf[:n].copy_(t)
+        return buf[:n].to(device, non_blocking=True)
+    return t.pin_memory().to(device, non_blocking=True)
 
 
 def _t2_rot_pos_emb(vis, grid_thw):
@@ -498,16 +521,25 @@ def _t2_get_cuda_sm89():
 
     def _t2_preprocess(self, items):
         \"\"\"shm-ring descriptors -> (pixel_values [N, 588] bf16 on the GPU, grid_thw [n, 3] CPU); enqueued on the CURRENT
-        stream: async H2D from the page-locked ring, bicubic antialias resize, fused patchify + normalize.\"\"\"
+        stream: async H2D from the page-locked ring, bicubic antialias resize, fused patchify + normalize directly into
+        one pre-allocated output tensor (no per-image alloc + torch.cat copy).\"\"\"
         mm = _t2_get_shm_reader()
         cuda_mod = _t2_get_cuda_sm89()
         if mm is None or cuda_mod is None:
             return None
         dev = self.visual.device
-        out_patches = []
-        grids = []
+        meta = []
+        total_patches = 0
+        grid_rows = []
         for item in items:
             _, off, nbytes, h, w, gh, gw = (int(v) for v in item.feature[0].tolist())
+            m = gh * gw
+            meta.append((off, nbytes, h, w, gh, gw, m))
+            total_patches += m
+            grid_rows.append((1, gh, gw))
+        pixel_values = torch.empty((total_patches, 588), dtype=torch.bfloat16, device=dev)
+        p_off = 0
+        for off, nbytes, h, w, gh, gw, m in meta:
             chw_cpu = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=off).view(3, h, w)
             chw_gpu = chw_cpu.to(device=dev, non_blocking=True)
             if (gh * 14, gw * 14) != (h, w):
@@ -517,17 +549,16 @@ def _t2_get_cuda_sm89():
                     interpolation=_t2_Interp.BICUBIC,
                     antialias=True,
                 )
-            out_patches.append(cuda_mod.chw_u8_patchify_norm_bf16(chw_gpu, gh, gw))
-            grids.append(item.image_grid_thw)
+            cuda_mod.chw_u8_patchify_norm_bf16(chw_gpu, gh, gw, out=pixel_values[p_off : p_off + m])
+            p_off += m
+        image_grid_thw = torch.tensor(grid_rows, dtype=torch.int64)
         if not self._t2_shm_gpu_logged:
             self._t2_shm_gpu_logged = True
             print(
-                f"[track2-k1-shm-gpu] FIRST HIT: count={len(items)} grid0={tuple(grids[0][0].tolist())} "
-                f"patches0={tuple(out_patches[0].shape)} {out_patches[0].dtype}",
+                f"[track2-k1-shm-gpu] FIRST HIT: count={len(items)} grid0={grid_rows[0]} "
+                f"patches0=({meta[0][6]}, 588) {pixel_values.dtype}",
                 flush=True,
             )
-        pixel_values = out_patches[0] if len(out_patches) == 1 else torch.cat(out_patches, dim=0)
-        image_grid_thw = grids[0] if len(grids) == 1 else torch.concat(grids, dim=0)
         return pixel_values, image_grid_thw
 
     def _t2_register_prefetch(self):

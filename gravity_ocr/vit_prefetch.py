@@ -40,8 +40,14 @@ RANK_ORDER = os.environ.get("TRACK2_RANK_ORDER", "1") == "1"
 # to the end of the queue, so its kernels are left to fill the LM's host-bound gaps late in the job as well.
 READY_TARGET = int(os.environ.get("TRACK2_VIT_PF_READY_TARGET", "0"))
 SCHED_PRIORITY = int(os.environ.get("TRACK2_SCHED_STREAM_PRIORITY", "-10"))
+# Hide ViT host_launch (~9-11 ms/batch) behind DECODE's event.synchronize() wait on the same scheduler thread
+HIDE_LAUNCH = os.environ.get("TRACK2_VIT_HIDE_LAUNCH", "1") == "1"
+# Hide ZMQ recv_pyobj() unpickling (+ optional process_input_requests) behind DECODE's event.synchronize() wait:
+# 0 = off, 1 = recv_pyobj into sched._t2_recv_buf while not event.query(), 2 = also process TokenizedGenerateReqInput + submit ViT
+RECV_HIDE = int(os.environ.get("TRACK2_RECV_HIDE", "2"))
 
 _PF: Optional["VitPrefetcher"] = None
+_SCHED = None
 
 try:  # multi-layer run log, ViT layer (L4)
     from gravity_ocr import t2log as _LOG
@@ -126,10 +132,13 @@ class VitPrefetcher:
         while self.inflight and self.inflight[0].query():
             self.inflight.popleft()
 
-    def pump(self) -> None:
+    def pump(self, max_batches: int = 0) -> int:
         """Keep up to MAX_INFLIGHT packed batches queued on the ViT stream (non-blocking: completion is polled)."""
         self.reap()
+        launched_n = 0
         while self.pending and len(self.inflight) < MAX_INFLIGHT:
+            if max_batches > 0 and launched_n >= max_batches:
+                break
             batch, patches = [], 0
             while self.pending and len(batch) < BATCH_IMAGES:
                 it = self.pending[0]
@@ -140,6 +149,8 @@ class VitPrefetcher:
                 batch.append(self.pending.popleft())
                 patches += m
             self.inflight.append(self._encode(batch))
+            launched_n += 1
+        return launched_n
 
     # ------------------------------------------------------------------ encoding (ViT stream)
     def _encode(self, items: List) -> None:
@@ -250,8 +261,56 @@ def register(pf: VitPrefetcher) -> None:
     _PF = pf
 
 
+def register_sched(sched) -> None:
+    global _SCHED
+    _SCHED = sched
+
+
 def get() -> Optional[VitPrefetcher]:
     return _PF
+
+
+def pump_behind_decode(event=None, max_batches: int = 1) -> int:
+    """Called on the scheduler thread right between self.event.record() and self.event.synchronize() so ViT
+    host_launch (~9ms) and ZMQ recv_pyobj() unpickling run in parallel with the GPU's 10-55 ms decode round."""
+    pf = _PF
+    launched = 0
+    if pf is not None and HIDE_LAUNCH and pf.pending:
+        if event is None or not event.query():
+            launched = pf.pump(max_batches=max_batches)
+    if RECV_HIDE > 0 and _SCHED is not None and event is not None:
+        sched = _SCHED
+        if sched.pp_rank == 0 and sched.attn_tp_rank == 0 and sched.attn_cp_rank == 0:
+            import zmq
+            from sglang.srt.managers.mm_utils import unwrap_shm_features
+            sock = sched.recv_from_tokenizer
+            buf = sched._t2_recv_buf
+            n_got = 0
+            while not event.query():
+                got_any = False
+                for _ in range(4):
+                    try:
+                        r = sock.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    unwrap_shm_features(r)
+                    got_any = True
+                    n_got += 1
+                    if RECV_HIDE >= 2 and hasattr(r, "input_ids") and hasattr(r, "rid"):
+                        sched.process_input_requests([r])
+                    else:
+                        buf.append(r)
+                if not got_any:
+                    break
+            if RECV_HIDE >= 2 and n_got > 0 and pf is not None and not event.query():
+                wq = sched.waiting_queue
+                if wq:
+                    if RANK_ORDER and len(wq) > 1:
+                        wq.sort(key=req_rank)
+                    pf.submit_reqs(wq)
+                if HIDE_LAUNCH and pf.pending and launched < max_batches and not event.query():
+                    launched += pf.pump(max_batches=max_batches - launched)
+    return launched
 
 
 def tick(sched) -> None:
@@ -281,6 +340,11 @@ def tick(sched) -> None:
                 and sum(1 for r in wq if launched(r)) >= READY_TARGET):
             pf.reap()
             pf.n_paced += 1  # enough encoded requests are waiting for LM slots: leave the GPU to the decode for now
+        elif HIDE_LAUNCH and sched.running_batch.reqs:
+            # Defer ViT kernel launch (~9ms) by ~0.3ms until right before decode/extend's GPU wait, where the GPU is
+            # already busy and the scheduler thread would otherwise sleep idle! Even when wq[0] is not yet launched,
+            # synchronous pump() cannot make ready(wq[0]) True 0.1ms later, so deferring always wins.
+            pf.reap()
         else:
             pf.pump()
     t1 = time.perf_counter() if _TRACE else 0.0

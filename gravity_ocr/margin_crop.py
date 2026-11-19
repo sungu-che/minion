@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Tuple
 
 import numpy as np
@@ -58,7 +59,7 @@ except Exception:
     _cpu_prep = None
 
 ENABLED = os.environ.get("TRACK2_MARGIN_CROP", "1") == "1"
-TASKS = tuple(t.strip() for t in os.environ.get("TRACK2_MARGIN_TASKS", "text,table,formula").split(",") if t.strip())
+TASKS = tuple(t.strip() for t in re.split(r"[,:;]", os.environ.get("TRACK2_MARGIN_TASKS", "text,table,formula")) if t.strip())
 PAD = int(os.environ.get("TRACK2_MARGIN_PAD", "8"))                # served px kept around strokes
 PAD_FAINT = int(os.environ.get("TRACK2_MARGIN_PAD_FAINT", "2"))    # served px kept around faint content
 PAD_MIN = int(os.environ.get("TRACK2_MARGIN_PAD_MIN", "4"))        # grid snap may shrink PAD down to this

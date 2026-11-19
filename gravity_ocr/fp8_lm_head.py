@@ -192,22 +192,30 @@ def quantize_act_fp8(x_bf16: torch.Tensor, f16_acc: bool = False) -> torch.Tenso
 
 def _pick_fp8_cfg(M: int, f16_acc: bool = False):
     if f16_acc:
-        # Tuned on L40S sm_89 (mma.f16.e4m3.e4m3.f16): 1210 us at M=3200 (1.24x vs FP32-accum FP8, ~2.5x vs BF16!)
-        if M <= 64:
-            return (16, 128, 128, 4, 3)
-        if M <= 256:
+        # Swept on L40S sm_89 across M=25..4000: match BM to next_pow2(M) for small M so W_fp8 (91MB) is streamed ONCE!
+        if M <= 32:
             return (32, 128, 128, 4, 3)
+        if M <= 64:
+            return (64, 256, 64, 8, 3)
+        if M <= 128:
+            return (128, 256, 128, 8, 3)
+        if M <= 256:
+            return (256, 128, 128, 8, 3)
         if M <= 768:
             return (64, 256, 128, 8, 3)
         return (128, 256, 128, 8, 3)
-    # FP32-accum configs tuned on L40S sm_89 (142 SMs, N=59288, K=1536): 1.9x-4.4x faster than stock BF16 lm_head
+    # FP32-accum configs swept on L40S sm_89 across M=25..4000
+    if M <= 32:
+        return (32, 256, 128, 8, 3)
     if M <= 64:
-        return (16, 128, 128, 4, 3)
+        return (64, 256, 64, 8, 3)
+    if M <= 128:
+        return (128, 256, 64, 8, 3)
     if M <= 256:
-        return (32, 128, 128, 4, 3)
-    if M <= 1408 or M >= 2800:
-        return (128, 128, 64, 4, 4)
-    return (64, 128, 128, 4, 3)
+        return (256, 128, 128, 8, 3)
+    if M <= 768:
+        return (64, 128, 128, 4, 3)
+    return (128, 256, 64, 8, 3)
 
 
 def _pick_bf16_cfg(M: int):

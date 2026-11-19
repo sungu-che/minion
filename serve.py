@@ -73,6 +73,8 @@ FSYNC_PREDICTIONS = os.environ.get("TRACK2_FSYNC_PREDICTIONS", "0") == "1"
 # Request ordering: "dens" (longest predicted decode rounds / area^beta, output-neutral), "rounds", "area", "text"
 ORDER = os.environ.get("TRACK2_ORDER", "v2f:0.05")
 ORDER_BETA = float(os.environ.get("TRACK2_ORDER_BETA", "0.25"))
+TEXT_BOOST = float(os.environ.get("TRACK2_TEXT_BOOST", "1.0"))
+FORMULA_BOOST = float(os.environ.get("TRACK2_FORMULA_BOOST", "1.0"))
 _JOB_NO = 0
 
 TASK_PROMPTS = {
@@ -441,9 +443,9 @@ def predict_rounds_v2(task_key: str, w: int, h: int, fsize: int) -> float:
     if task_key == "table":
         y = 3.28 + 0.20 * lf + 0.08 * la
     elif task_key == "formula":
-        y = -1.23 + 0.50 * la
+        return math.exp(min(-1.23 + 0.50 * la, 9.0)) * FORMULA_BOOST
     else:
-        y = -2.61 + 0.37 * lf + 0.29 * la
+        return math.exp(min(-2.61 + 0.37 * lf + 0.29 * la, 9.0)) * TEXT_BOOST
     return math.exp(min(y, 9.0))
 
 
