@@ -22,6 +22,7 @@ import torch
 _ON = os.environ.get("TRACK2_FUSED", "1") == "1"
 _MLP = _ON and os.environ.get("TRACK2_FUSED_MLP", "1") == "1"
 _MROPE = _ON and os.environ.get("TRACK2_FUSED_MROPE", "1") == "1"
+_NORM = _ON and os.environ.get("TRACK2_FUSED_NORM", "1") == "1"
 _INSTALLED = False
 
 
@@ -116,6 +117,97 @@ def _install_mrope() -> bool:
     return True
 
 
+def _install_norm(C) -> int:
+    """(residual add +) RMSNorm -> FP8 quant fused into the layer forwards (kernel == flashinfer norm + sgl-kernel quant,
+    bitwise), feeding the same fp8_scaled_mm calls apply_fp8_linear would make:
+
+      LM  (Glm4DecoderLayer): input_layernorm(+add) -> qkv_proj ; post_self_attn_layernorm -> add -> post_attention_layernorm
+          -> gate_up_proj ; silu*up -> down_proj (fused as in the MLP patch); post_mlp_layernorm stays SGLang's.
+      ViT (GlmOcrVisionBlock): norm1 -> qkv_proj (handed to the patched VisionAttention as _t2_pre_qkv); add + norm2 ->
+          gate_up_proj ; silu*up -> down_proj; the final residual add stays a torch add.
+    A layer whose linears are not on that exact FP8 path (or an unexpected shape) runs SGLang's forward."""
+    from sglang.srt.layers.quantization import fp8_utils as fu
+    from sglang.srt.models import glm4, glm_ocr
+
+    scaled_mm = fu.fp8_scaled_mm
+
+    def lin(layer, q8, s, dtype):
+        return scaled_mm(q8, layer.weight, s, layer.weight_scale, out_dtype=dtype, bias=layer.bias)
+
+    n = 0
+    L = glm4.Glm4DecoderLayer
+    if not getattr(L.forward, "_t2_fused", False):
+        orig_l = L.forward
+
+        def layer_forward(self, positions, hidden_states, forward_batch, residual):
+            at, mlp = self.self_attn, self.mlp
+            if (hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2
+                    or hidden_states.shape[-1] not in (1024, 1536) or not hidden_states.is_contiguous()
+                    or (residual is not None and not residual.is_contiguous())
+                    or not (_down_ok(at.qkv_proj) and _down_ok(mlp.gate_up_proj) and _down_ok(mlp.down_proj))):
+                return orig_l(self, positions, hidden_states, forward_batch, residual)
+            dt = hidden_states.dtype
+            if residual is None:
+                residual = hidden_states
+                q8, s = C.norm_quant_fp8(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon,
+                                         mode=C.NORM_MODE_PLAIN)
+            else:
+                # == fused_add_rmsnorm(hidden_states, residual): residual += hidden_states (in place); the normalized rows
+                # go straight to FP8 (SGLang also overwrote hidden_states with them; nothing reads that buffer again)
+                q8, s = C.norm_quant_fp8(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon,
+                                         residual=residual, mode=C.NORM_MODE_ADD)
+            qkv = lin(at.qkv_proj, q8, s, dt)
+            q, k, v = qkv.split([at.q_size, at.kv_size, at.kv_size], dim=-1)
+            q, k = at.rotary_emb(positions, q, k)
+            o, _ = at.o_proj(at.attn(q, k, v, forward_batch))
+            q8, s = C.norm_quant_fp8(o, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon,
+                                     residual=residual, mode=C.NORM_MODE_PRE_ADD,
+                                     weight0=self.post_self_attn_layernorm.weight,
+                                     eps0=self.post_self_attn_layernorm.variance_epsilon)
+            gate_up = lin(mlp.gate_up_proj, q8, s, dt)
+            q8, s = C.silu_mul_quant_fp8(gate_up)
+            down = lin(mlp.down_proj, q8, s, dt)
+            return self.post_mlp_layernorm(down), residual
+
+        layer_forward._t2_fused = True
+        L.forward = layer_forward
+        n += 1
+
+    B = glm_ocr.GlmOcrVisionBlock
+    if not getattr(B.forward, "_t2_fused", False) and os.environ.get("TRACK2_FUSED_NORM_VIT", "1") == "1":
+        orig_b = B.forward
+
+        def block_forward(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin):
+            at, mlp = self.attn, self.mlp
+            if (x.dim() != 3 or x.shape[1] != 1 or x.shape[0] == 0 or x.dtype != torch.bfloat16
+                    or x.shape[-1] not in (1024, 1536) or not x.is_contiguous()
+                    or not getattr(at, "_track2_k2_inplace", False)
+                    or not (_down_ok(at.qkv_proj) and _down_ok(mlp.gate_up_proj) and _down_ok(mlp.down_proj))):
+                return orig_b(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
+            S, _, H = x.shape
+            x2d = x.view(S, H)
+            q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, mode=C.NORM_MODE_PLAIN)
+            at._t2_pre_qkv = lin(at.qkv_proj, q8, s, x.dtype).view(1, S, -1)   # consumed by the patched attention forward
+            attn = at(x.view(1, S, H), cu_seqlens=cu_seqlens, rotary_pos_emb_cos=rotary_pos_emb_cos,
+                      rotary_pos_emb_sin=rotary_pos_emb_sin)
+            at.__dict__.pop("_t2_pre_qkv", None)
+            attn2d = attn.reshape(S, H)
+            if not attn2d.is_contiguous():
+                attn2d = attn2d.contiguous()
+            # == norm2(x2d, residual=attn2d): attn2d <- x + attn (x_after_add), normalized rows -> FP8
+            q8, s = C.norm_quant_fp8(x2d, self.norm2.weight, self.norm2.variance_epsilon, residual=attn2d,
+                                     mode=C.NORM_MODE_ADD)
+            gate_up = lin(mlp.gate_up_proj, q8, s, x.dtype)
+            q8, s = C.silu_mul_quant_fp8(gate_up)
+            mlp_out = lin(mlp.down_proj, q8, s, x.dtype)
+            return (attn2d + mlp_out).view(S, 1, H)
+
+        block_forward._t2_fused = True
+        B.forward = block_forward
+        n += 1
+    return n
+
+
 def install() -> None:
     global _INSTALLED
     if _INSTALLED or not _ON:
@@ -126,6 +218,12 @@ def install() -> None:
     from gravity_ocr import cuda_sm89 as C
 
     parts = []
+    try:  # must precede _install_mlp / _install_norm: they capture fp8_utils.fp8_scaled_mm
+        from gravity_ocr import fp8_gemm
+
+        parts.append(fp8_gemm.install())
+    except Exception as e:
+        parts.append(f"Triton FP8 GEMM unavailable ({e})")
     if _MLP:
         if C.fused_available():
             parts.append(f"silu*up+fp8-quant MLP ({_install_mlp(C)} classes)")
@@ -137,4 +235,12 @@ def install() -> None:
             parts.append("fast M-RoPE")
         except Exception as e:  # triton / signature drift: keep SGLang's kernel
             parts.append(f"M-RoPE fusion unavailable ({e})")
+    if _NORM and _MLP:
+        if C.norm_available():
+            try:
+                parts.append(f"norm+fp8-quant layers ({_install_norm(C)} classes)")
+            except Exception as e:
+                parts.append(f"norm fusion unavailable ({e})")
+        else:
+            parts.append("norm fusion unavailable (libtrack2_cuda_sm89.so without track2_norm_quant_fp8)")
     print(f"[track2-fused] ON: {', '.join(parts) or 'nothing'}", flush=True)

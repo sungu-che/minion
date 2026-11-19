@@ -110,6 +110,63 @@ def test_smq() -> bool:
     return best[winner] == 0
 
 
+def test_norm() -> bool:
+    """norm_quant_fp8 (4 modes) == sgl_kernel.rmsnorm / fused_add_rmsnorm (+ torch add) + sglang_per_token_quant_fp8."""
+    import sgl_kernel
+    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+
+    torch.manual_seed(4)
+    eps = 1e-5
+    tot = {}
+    for hdim in (1536, 1024):
+        w = (1 + 0.2 * torch.randn(hdim, device="cuda")).to(torch.bfloat16)
+        w0 = (1 + 0.2 * torch.randn(hdim, device="cuda")).to(torch.bfloat16)
+        for m in (1, 7, 33, 264, 3168, 16384):
+            x = (torch.randn(m, hdim, device="cuda") * 3).to(torch.bfloat16)
+            r = (torch.randn(m, hdim, device="cuda") * 5).to(torch.bfloat16)
+            x[: max(1, m // 8)] *= 20
+            refs = {}
+            refs[0] = (sgl_kernel.rmsnorm(x, w, eps), None)
+            x1, r1 = x.clone(), r.clone()
+            sgl_kernel.fused_add_rmsnorm(x1, r1, w, eps)
+            refs[1] = (x1, r1)
+            z = sgl_kernel.rmsnorm(x, w0, eps)
+            r2 = r.clone()
+            sgl_kernel.fused_add_rmsnorm(z, r2, w, eps)
+            refs[2] = (z, r2)
+            h = x + r
+            refs[3] = (sgl_kernel.rmsnorm(h, w, eps), h)
+            line = []
+            for mode in range(4):
+                y_ref, r_ref = refs[mode]
+                q_ref, s_ref = sglang_per_token_quant_fp8(y_ref)
+                for red in range(4):
+                    for dv in range(2):
+                        rr = r.clone()
+                        q, s, y = C.norm_quant_fp8(x, w, eps, residual=rr if mode else None, mode=mode, weight0=w0, eps0=eps,
+                                                   want_y=True, red=red, div=dv)
+                        bad = int((y != y_ref).sum()) + int((q.view(torch.uint8) != q_ref.view(torch.uint8)).sum()) \
+                            + int((s.view(-1) != s_ref.view(-1)).sum()) + (int((rr != r_ref).sum()) if r_ref is not None else 0)
+                        tot[(red, dv)] = tot.get((red, dv), 0) + bad
+                        if red == 0 and dv == 0:
+                            line.append(f"m{mode}:{bad}")
+            # timing: mode-2 fused kernel vs the 3 SGLang kernels it replaces (rmsnorm, fused_add_rmsnorm, quant)
+            def ref2():
+                zz = sgl_kernel.rmsnorm(x, w0, eps)
+                rr2 = r.clone()
+                sgl_kernel.fused_add_rmsnorm(zz, rr2, w, eps)
+                return sglang_per_token_quant_fp8(zz)
+            rr3 = r.clone()
+            t_ref = bench(ref2)
+            t_new = bench(lambda: C.norm_quant_fp8(x, w, eps, residual=rr3, mode=2, weight0=w0, eps0=eps))
+            print(f"NORM H={hdim} M={m:6d} red0/div0 mismatches {' '.join(line)} | mode2 ref {t_ref:7.1f}us fused {t_new:7.1f}us",
+                  flush=True)
+    best = min(tot, key=tot.get)
+    print(f"NORM variant totals {dict(sorted(tot.items()))} -> RED={best[0]} DIV={best[1]} "
+          f"({'exact' if tot[best] == 0 else 'NOT exact'})", flush=True)
+    return tot[best] == 0
+
+
 def test_mrope() -> bool:
     from sglang.srt.layers.rotary_embedding.triton_kernels import triton_mrope_fused
 
@@ -166,4 +223,6 @@ if __name__ == "__main__":
         ok &= test_smq()
     if "mrope" in which:
         ok &= test_mrope()
+    if "norm" in which:
+        ok &= test_norm()
     print("[test] ALL BITWISE OK" if ok else "[test] MISMATCHES (see above)", flush=True)

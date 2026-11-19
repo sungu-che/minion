@@ -140,6 +140,25 @@ def crate_lib(crate: Path) -> str:
     return "gravity_kernels" if crate.name == "rust_kernels" else "gravity_gpu"
 
 
+def build_cuda_sm89(env: dict) -> Path | None:
+    """libtrack2_cuda_sm89.so: the live sm_89 kernels of the SGLang path (patchify, K2, fused FP8 norm / SiLU / quant,
+    argmax). Plain nvcc, no cargo; written straight into gravity_ocr/_native (the serving path refuses a stale build:
+    gravity_ocr/cuda_sm89.py checks the fused ABI)."""
+    src = ROOT / "rust_gpu" / "kernels" / "track2_cuda_sm89.cu"
+    root = cuda_root()
+    nvcc = str(root / "bin" / "nvcc") if root and (root / "bin" / "nvcc").exists() else shutil.which("nvcc")
+    if not nvcc:
+        print("  warning: nvcc not found; libtrack2_cuda_sm89.so not built")
+        return None
+    out = OUT / "libtrack2_cuda_sm89.so"
+    cmd = [nvcc, "-O3", "-std=c++17", f"-arch=sm_{env.get('CUDA_COMPUTE_CAP', '89')}", "--shared", "-Xcompiler", "-fPIC",
+           "-o", str(out), str(src)]
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True, env=env)
+    print(f"  -> {out}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", default="auto", help="auto | none | comma list of rocm, vulkan, cuda")
@@ -148,9 +167,15 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     built = []
-    if not args.no_cpu:
+    have_cargo = shutil.which("cargo") is not None
+    if not have_cargo:
+        print("  warning: cargo not found: skipping the Rust crates (the SGLang serving path does not load them)")
+    if not args.no_cpu and have_cargo:
         built.append(cargo(ROOT / "rust_kernels", [], env))
-    if args.gpu != "none":
+    if args.gpu != "none" and ("cuda" in [f.strip() for f in args.gpu.split(",")]
+                               or (args.gpu == "auto" and cuda_root() is not None)):
+        build_cuda_sm89(env)
+    if args.gpu != "none" and have_cargo:
         if args.gpu == "auto":
             feats = ["vulkan"]
             if hip_root():

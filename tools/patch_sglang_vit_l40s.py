@@ -80,7 +80,9 @@ def patch_vision_py(src: str) -> str:
             if _k2_fn and _k2_ip and (cu_seqlens[0].numel() == 2 or (
                 _T2_FA2_VARLEN and type(self.qkv_backend).__name__ == "VisionTritonAttention")):
                 # [TRACK2-K2-INPLACE] same values as K2 (bitwise), no [S, H, 64] q / k / v copies
-                qkv, _ = self.qkv_proj(x)
+                qkv = self.__dict__.pop("_t2_pre_qkv", None)  # [TRACK2-PRE-QKV] fused norm1->FP8->qkv GEMM of the block
+                if qkv is None:
+                    qkv, _ = self.qkv_proj(x)
                 if not qkv.is_contiguous():
                     qkv = qkv.contiguous()
                 q3, k3, v3 = _k2_ip(
@@ -115,7 +117,9 @@ def patch_vision_py(src: str) -> str:
                 output, _ = self.proj(output)
                 return output
             if _k2_fn:
-                qkv, _ = self.qkv_proj(x)
+                qkv = self.__dict__.pop("_t2_pre_qkv", None)  # [TRACK2-PRE-QKV] fused norm1->FP8->qkv GEMM of the block
+                if qkv is None:
+                    qkv, _ = self.qkv_proj(x)
                 if cu_seqlens[0].numel() == 2:
                     q4, k4, v4 = _k2_fn(
                         qkv,
@@ -158,7 +162,9 @@ def patch_vision_py(src: str) -> str:
 
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
-            qkv, _ = self.qkv_proj(x)
+            qkv = self.__dict__.pop("_t2_pre_qkv", None)  # [TRACK2-PRE-QKV] fused norm1->FP8->qkv GEMM of the block
+            if qkv is None:
+                qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)"""
     if target_attn not in src:
         raise RuntimeError("Could not locate VisionAttention.forward qkv_proj block in vision.py")

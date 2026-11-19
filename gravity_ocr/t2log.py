@@ -133,6 +133,7 @@ class _SchedLayer:
         self.recv = 0
         self.t_first = None
         self.t_last = None
+        self.commit_hist: Dict[int, int] = {}  # level >= 2: tokens committed per request-round -> count
 
     # L4 hooks (vit_prefetch.py)
     def vit_batch(self, n_img: int, patches: int, launch_ms: float, ev0, ev1, ondemand: bool) -> None:
@@ -208,6 +209,7 @@ class _SchedLayer:
             "gaps_s": round(sum(max(0.0, g) for g in gaps), 4),
             "gap_ms_p50_p90_max": [None if v is None else round(1e3 * v, 1) for v in q(gaps, 0.5, 0.9, 1.0)],
             "finished": sum(r.get("fin", 0) for r in dec) + sum(r.get("fin", 0) for r in ext),
+            **({"commit_hist": dict(sorted(self.commit_hist.items()))} if self.commit_hist else {}),
         })
         # L4: resolve the batch GPU times (events of finished batches; no synchronization)
         if self.vit_batches:
@@ -257,7 +259,10 @@ def install_scheduler() -> None:
         try:
             if batch.forward_mode.is_extend():
                 st["ext_tok"] = int(sum(getattr(r, "extend_input_len", 0) or 0 for r in batch.reqs))
-            st["_out0"] = int(sum(len(r.output_ids) for r in batch.reqs))
+            lens = [len(r.output_ids) for r in batch.reqs]
+            st["_out0"] = int(sum(lens))
+            if LEVEL >= 2 and not batch.forward_mode.is_extend():
+                st["_lens0"] = lens  # per-request tokens committed this round (acceptance histogram)
         except Exception:
             pass
         res = orig_run(self, batch, *a, **k)
@@ -274,8 +279,15 @@ def install_scheduler() -> None:
             try:
                 st["commit"] = int(sum(len(x.output_ids) for x in batch.reqs)) - st.pop("_out0", 0)
                 st["fin"] = int(sum(1 for x in batch.reqs if x.finished()))
+                lens0 = st.pop("_lens0", None)
+                if lens0 is not None and len(lens0) == len(batch.reqs):
+                    h = SCHED.commit_hist
+                    for x, n0 in zip(batch.reqs, lens0):
+                        c = len(x.output_ids) - n0
+                        h[c] = h.get(c, 0) + 1
             except Exception:
                 st.pop("_out0", None)
+                st.pop("_lens0", None)
             for k in ("t0", "t1", "t2"):
                 st[k] = round(st[k], 5)
             SCHED.iteration(st)

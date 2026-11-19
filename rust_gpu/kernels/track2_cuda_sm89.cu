@@ -658,6 +658,137 @@ gk_quant_fp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t x_stride, 
 }
 
 // ---------------------------------------------------------------------------------------------
+// 7. gk_norm_quant_fp8: RMSNorm (+ residual add) -> per-token FP8, in one pass.
+//    Norm arithmetic = flashinfer 0.6.7's CuTe-DSL RMSNormKernel / FusedAddRMSNormKernel for H = 256 * NB
+//    (32 threads per row; thread t owns the 8-wide vectors at columns 8 t + 256 b, b < NB; per-thread
+//    sum of squares (order: RED), butterfly shuffles with offsets 1, 2, 4, 8, 16, mean = sum / H (DIV),
+//    rstd = rsqrt.approx.ftz(mean + eps), y = bf16((h * rstd) * (w + 0))). Quant = sgl-kernel's
+//    per-token FP8 (scale = max|y| / 448) on the bf16 y, i.e. the same as t2_quant8 above.
+//    MODE 0: h = x                                         (plain RMSNorm)
+//    MODE 1: h = x + r (fp32), r <- bf16(h)                (FusedAddRMSNorm: r = residual, updated in place)
+//    MODE 2: z = bf16(RMSNorm(x; w0)), h = z + r, r <- bf16(h)  (GLM: post_self_attn_layernorm, then
+//            post_attention_layernorm's fused add)
+//    MODE 3: h = bf16(x + r) (torch add), r <- h            (ViT: x_after_add + mlp_out, then norm1)
+//    Optional y_out keeps the bf16 normalized row (testing / callers that need it).
+// ---------------------------------------------------------------------------------------------
+__device__ __forceinline__ float t2_rsqrt_approx(float x) {
+    float y;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+template <int NB, int RED>
+__device__ __forceinline__ float t2_row_sumsq(const float (&h)[NB][8]) {
+    float s = 0.0f;
+    if constexpr (RED == 0) {            // ordered over (v fastest, then b); separate multiply / add
+#pragma unroll
+        for (int b = 0; b < NB; ++b)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) s = __fadd_rn(s, __fmul_rn(h[b][v], h[b][v]));
+    } else if constexpr (RED == 1) {     // ordered, fused multiply-add
+#pragma unroll
+        for (int b = 0; b < NB; ++b)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) s = __fmaf_rn(h[b][v], h[b][v], s);
+    } else if constexpr (RED == 2) {     // ordered over (b fastest, then v)
+#pragma unroll
+        for (int v = 0; v < 8; ++v)
+#pragma unroll
+            for (int b = 0; b < NB; ++b) s = __fadd_rn(s, __fmul_rn(h[b][v], h[b][v]));
+    } else {                             // RED 3: ordered over (b fastest, then v), fused
+#pragma unroll
+        for (int v = 0; v < 8; ++v)
+#pragma unroll
+            for (int b = 0; b < NB; ++b) s = __fmaf_rn(h[b][v], h[b][v], s);
+    }
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, off));
+    return s;
+}
+
+template <int NB, int RED, int DIV>
+__device__ __forceinline__ float t2_rstd(const float (&h)[NB][8], float eps) {
+    const float ss = t2_row_sumsq<NB, RED>(h);
+    const float mean = DIV == 0 ? __fdiv_rn(ss, (float)(NB * 256)) : __fdividef(ss, (float)(NB * 256));
+    return t2_rsqrt_approx(__fadd_rn(mean, eps));
+}
+
+template <int NB, int RED, int DIV, int MODE, bool QUANT>
+__global__ void __launch_bounds__(128)
+gk_norm_quant_fp8_kernel(
+    const __nv_bfloat16* __restrict__ x, int64_t x_stride,
+    __nv_bfloat16* __restrict__ r, int64_t r_stride,
+    const __nv_bfloat16* __restrict__ w0, float eps0,
+    const __nv_bfloat16* __restrict__ w, float eps,
+    __nv_bfloat16* __restrict__ y_out, int64_t y_stride,
+    uint8_t* __restrict__ q, float* __restrict__ scale,
+    int M
+) {
+    const int row = (int)blockIdx.x * 4 + ((int)threadIdx.x >> 5);
+    if (row >= M) return;                   // whole warps exit together (one row per warp)
+    const int t = (int)threadIdx.x & 31;
+    const __nv_bfloat16* xr = x + (int64_t)row * x_stride;
+    float h[NB][8];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) t2_unpack8(reinterpret_cast<const uint4*>(xr)[t + 32 * b], h[b]);
+    if constexpr (MODE == 2) {              // z = bf16(RMSNorm(x; w0))
+        const float rs0 = t2_rstd<NB, RED, DIV>(h, eps0);
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            float wv[8], z[8];
+            t2_unpack8(reinterpret_cast<const uint4*>(w0)[t + 32 * b], wv);
+#pragma unroll
+            for (int v = 0; v < 8; ++v) z[v] = __fmul_rn(__fmul_rn(h[b][v], rs0), __fadd_rn(wv[v], 0.0f));
+            t2_unpack8(t2_pack8(z), h[b]);  // round to bf16 like the stored RMSNorm output
+        }
+    }
+    if constexpr (MODE >= 1) {
+        __nv_bfloat16* rr = r + (int64_t)row * r_stride;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            float rv[8];
+            t2_unpack8(reinterpret_cast<const uint4*>(rr)[t + 32 * b], rv);
+#pragma unroll
+            for (int v = 0; v < 8; ++v) h[b][v] = __fadd_rn(h[b][v], rv[v]);
+            const uint4 hb = t2_pack8(h[b]);
+            reinterpret_cast<uint4*>(rr)[t + 32 * b] = hb;
+            if constexpr (MODE == 3) t2_unpack8(hb, h[b]);   // torch's bf16 add: the norm sees the rounded sum
+        }
+    }
+    const float rs = t2_rstd<NB, RED, DIV>(h, eps);
+    uint4 yv[NB];
+    float amax = 0.0f;
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        float wv[8], y[8];
+        t2_unpack8(reinterpret_cast<const uint4*>(w)[t + 32 * b], wv);
+#pragma unroll
+        for (int v = 0; v < 8; ++v) y[v] = __fmul_rn(__fmul_rn(h[b][v], rs), __fadd_rn(wv[v], 0.0f));
+        yv[b] = t2_pack8(y);
+        if (y_out != nullptr) reinterpret_cast<uint4*>(y_out + (int64_t)row * y_stride)[t + 32 * b] = yv[b];
+        if constexpr (QUANT) {
+            float yb[8];
+            t2_unpack8(yv[b], yb);
+#pragma unroll
+            for (int v = 0; v < 8; ++v) amax = fmaxf(amax, fabsf(yb[v]));
+        }
+    }
+    if constexpr (QUANT) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        float s, sinv;
+        t2_fp8_scale<0>(amax, s, sinv);
+        if (t == 0) scale[row] = s;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            float yb[8];
+            t2_unpack8(yv[b], yb);
+            reinterpret_cast<uint2*>(q + (int64_t)row * (NB * 256))[t + 32 * b] = t2_quant8(yb, sinv);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // C-ABI entrypoints called via ctypes on PyTorch's active cudaStream_t (CUDA Graph safe!)
 // ---------------------------------------------------------------------------------------------
 extern "C" {
@@ -719,6 +850,48 @@ int track2_silu_mul_quant_fp8(
             case 12: T2_SMQ_CASE(6, 1, 2); break;
             default: return 1003;
         }
+    }
+    return (int)cudaGetLastError();
+}
+
+#define T2_NQ_LAUNCH(NB_, RED_, DIV_, MODE_)                                                                      \
+    gk_norm_quant_fp8_kernel<NB_, RED_, DIV_, MODE_, true><<<blocks, 128, 0, stream>>>(                           \
+        (const __nv_bfloat16*)x_bf16, x_stride, (__nv_bfloat16*)r_bf16, r_stride, (const __nv_bfloat16*)w0_bf16, eps0, \
+        (const __nv_bfloat16*)w_bf16, eps, (__nv_bfloat16*)y_bf16, y_stride, (uint8_t*)q_e4m3, (float*)scale_f32, M)
+
+#define T2_NQ_MODES(NB_, RED_, DIV_)                         \
+    switch (mode) {                                          \
+        case 0: T2_NQ_LAUNCH(NB_, RED_, DIV_, 0); break;     \
+        case 1: T2_NQ_LAUNCH(NB_, RED_, DIV_, 1); break;     \
+        case 2: T2_NQ_LAUNCH(NB_, RED_, DIV_, 2); break;     \
+        case 3: T2_NQ_LAUNCH(NB_, RED_, DIV_, 3); break;     \
+        default: return 1004;                                \
+    }
+
+#define T2_NQ_RED(NB_, DIV_)                                 \
+    switch (red) {                                           \
+        case 0: T2_NQ_MODES(NB_, 0, DIV_); break;            \
+        case 1: T2_NQ_MODES(NB_, 1, DIV_); break;            \
+        case 2: T2_NQ_MODES(NB_, 2, DIV_); break;            \
+        case 3: T2_NQ_MODES(NB_, 3, DIV_); break;            \
+        default: return 1005;                                \
+    }
+
+// v6: (residual add +) RMSNorm -> per-token FP8 (gk_norm_quant_fp8_kernel). H must be 1024 or 1536.
+int track2_norm_quant_fp8(
+    const void* x_bf16, int64_t x_stride, void* r_bf16, int64_t r_stride, const void* w0_bf16, float eps0,
+    const void* w_bf16, float eps, void* y_bf16, int64_t y_stride, void* q_e4m3, void* scale_f32, int M, int H,
+    int mode, int red, int div, void* stream_ptr
+) {
+    if (M <= 0) return 0;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const int blocks = (M + 3) / 4;
+    if (H == 1536) {
+        if (div == 0) { T2_NQ_RED(6, 0); } else { T2_NQ_RED(6, 1); }
+    } else if (H == 1024) {
+        if (div == 0) { T2_NQ_RED(4, 0); } else { T2_NQ_RED(4, 1); }
+    } else {
+        return 1006;
     }
     return (int)cudaGetLastError();
 }

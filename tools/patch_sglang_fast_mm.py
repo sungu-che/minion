@@ -92,6 +92,15 @@ _SHM_NP: Optional[np.ndarray] = None
 _SHM_OFFSET = 0
 
 
+def _t2_sm89_lib_present() -> bool:
+    try:
+        from gravity_ocr import cuda_sm89 as _c
+
+        return _c._find_lib() is not None
+    except Exception:
+        return False
+
+
 def _get_shm_ring() -> Optional[mmap.mmap]:
     global _SHM_MMAP, _SHM_NP
     if _SHM_MMAP is not None:
@@ -103,7 +112,9 @@ def _get_shm_ring() -> Optional[mmap.mmap]:
             fd = os.open(SHM_RING_PATH, os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 if os.fstat(fd).st_size < SHM_RING_BYTES:
-                    os.ftruncate(fd, SHM_RING_BYTES)
+                    # allocate the pages now: a /dev/shm smaller than the ring fails here (ENOSPC -> CPU fallback)
+                    # instead of SIGBUS-ing the tokenizer on a later write into a sparse file
+                    os.posix_fallocate(fd, 0, SHM_RING_BYTES)
                 _SHM_MMAP = mmap.mmap(fd, SHM_RING_BYTES, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
                 _SHM_NP = np.frombuffer(_SHM_MMAP, dtype=np.uint8)
             finally:
@@ -292,7 +303,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
 
         self._fast_mm_enabled = os.environ.get("TRACK2_FAST_MM", "1") == "1" and _g_preprocess is not None
-        self._shm_gpu_enabled = os.environ.get("TRACK2_SHM_GPU_MM", "1") == "1" and (_get_shm_ring() is not None)
+        self._shm_gpu_enabled = (
+            os.environ.get("TRACK2_SHM_GPU_MM", "1") == "1"
+            and _t2_sm89_lib_present()  # the scheduler decodes shm descriptors with libtrack2_cuda_sm89.so
+            and (_get_shm_ring() is not None)
+        )
         workers = int(os.environ.get("TRACK2_MM_WORKERS", "2"))
         self._fast_pool = ThreadPoolExecutor(max_workers=max(1, workers)) if workers > 0 else None
         self._prompt_id_cache: Dict[str, Tuple[List[int], List[int]]] = {}

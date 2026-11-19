@@ -138,6 +138,7 @@ def available() -> bool:
 # ---------------------------------------------------------------------------------------------- v6 fused kernels
 # Registered separately: a .so built from an older .cu (no fused symbols) still serves the kernels above.
 _FUSED = False
+_NORM = False
 FUSED_ABI = 1
 # arithmetic variants of the fused SiLU / FP8-scale math (picked by tools/test_fused_kernels.py: the pair whose outputs
 # are bitwise equal to sgl_kernel.silu_and_mul + sgl_per_token_quant_fp8 on this build)
@@ -162,11 +163,23 @@ def _register_fused(lib: ctypes.CDLL) -> bool:
         _FUSED = True
     except AttributeError:
         _FUSED = False
+    global _NORM
+    try:  # added after ABI 1 builds shipped: optional, the kernels above keep working without it
+        lib.track2_norm_quant_fp8.argtypes = [vp, i64, vp, i64, vp, f32, vp, f32, vp, i64, vp, vp, i32, i32, i32, i32, i32,
+                                              vp]
+        lib.track2_norm_quant_fp8.restype = i32
+        _NORM = _FUSED
+    except AttributeError:
+        _NORM = False
     return _FUSED
 
 
 def fused_available() -> bool:
     return load() is not None and _FUSED
+
+
+def norm_available() -> bool:
+    return load() is not None and _NORM
 
 
 def vis_qk_norm_rope_inplace(
@@ -227,6 +240,62 @@ def silu_mul_quant_fp8(gate_up: torch.Tensor, act_mode: Optional[int] = None,
     if err != 0:
         raise RuntimeError(f"track2_silu_mul_quant_fp8 CUDA error {err}")
     return q, s
+
+
+NORM_RED = int(os.environ.get("TRACK2_NORM_RED", "1"))  # RED=1 DIV=0: bitwise == flashinfer 0.6.7 norms
+NORM_DIV = int(os.environ.get("TRACK2_NORM_DIV", "0"))
+NORM_MODE_PLAIN, NORM_MODE_ADD, NORM_MODE_PRE_ADD, NORM_MODE_ROUND_ADD = 0, 1, 2, 3
+
+
+def norm_quant_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: Optional[torch.Tensor] = None,
+    mode: int = NORM_MODE_PLAIN,
+    weight0: Optional[torch.Tensor] = None,
+    eps0: float = 0.0,
+    want_y: bool = False,
+    red: Optional[int] = None,
+    div: Optional[int] = None,
+):
+    """(residual add +) RMSNorm (flashinfer arithmetic) -> per-token FP8 (sgl-kernel arithmetic), one kernel.
+
+    mode 0: y = RMSNorm(x)                     mode 1: residual += x (in place), y = RMSNorm(residual) [fused_add_rmsnorm]
+    mode 2: z = RMSNorm(x; weight0), residual += z, y = RMSNorm(residual)  (two norms + add)
+    mode 3: residual = bf16(x + residual), y = RMSNorm(residual)            (torch add, then RMSNorm)
+    Returns (q [M, H] float8_e4m3fn, scale [M, 1] float32) or, with want_y, (q, scale, y bf16)."""
+    lib = load()
+    assert lib is not None and _NORM
+    hdim = int(x.shape[-1])
+    x2 = x.reshape(-1, hdim)
+    m = int(x2.shape[0])
+    dev = x.device
+    q = torch.empty((m, hdim), dtype=torch.float8_e4m3fn, device=dev)
+    s = torch.empty((m, 1), dtype=torch.float32, device=dev)
+    y = torch.empty((m, hdim), dtype=torch.bfloat16, device=dev) if want_y else None
+    if m == 0:
+        return (q, s, y) if want_y else (q, s)
+    if mode != NORM_MODE_PLAIN:
+        assert residual is not None
+        r2 = residual.reshape(-1, hdim)
+        assert r2.stride(-1) == 1 and r2.data_ptr() % 16 == 0 and (r2.stride(0) * 2) % 16 == 0
+        r_ptr, r_stride = r2.data_ptr(), int(r2.stride(0))
+    else:
+        r_ptr, r_stride = None, 0
+    assert x2.stride(-1) == 1 and x2.data_ptr() % 16 == 0 and (x2.stride(0) * 2) % 16 == 0
+    stream = torch.cuda.current_stream(dev).cuda_stream
+    err = lib.track2_norm_quant_fp8(
+        x2.data_ptr(), int(x2.stride(0)), r_ptr, r_stride,
+        weight0.data_ptr() if weight0 is not None else None, float(eps0),
+        weight.data_ptr(), float(eps),
+        y.data_ptr() if y is not None else None, hdim,
+        q.data_ptr(), s.data_ptr(), m, hdim, int(mode),
+        NORM_RED if red is None else int(red), NORM_DIV if div is None else int(div), stream,
+    )
+    if err != 0:
+        raise RuntimeError(f"track2_norm_quant_fp8 CUDA error {err}")
+    return (q, s, y) if want_y else (q, s)
 
 
 def quant_fp8_rows(x: torch.Tensor, qnt_mode: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
