@@ -192,10 +192,233 @@ class _T2DraftModule:
 '''
 
 
+KV_NOSPLIT_HEADER = '''
+
+# [TRACK2-KV-NOSPLIT] graph wrappers that can only ever plan one KV chunk per request run without flashinfer's KV split
+# (no merge kernel); "0" = the stock graph plan.
+_T2_KV_NOSPLIT = os.environ.get("TRACK2_KV_NOSPLIT", "1") == "1"
+
+# [TRACK2-ATTN-NOFILL] wrappers hand run() an uninitialized output instead of flashinfer's torch.zeros (every element
+# is overwritten by the attention/merge kernel); "0" = flashinfer's own allocation.
+_T2_ATTN_NOFILL = os.environ.get("TRACK2_ATTN_NOFILL", "1") == "1"
+
+
+def _t2_nofill_wrapper(base):
+    """flashinfer's paged prefill wrapper with run() allocating its output uninitialized."""
+
+    class _T2NoFillWrapper(base):
+        def run(self, q, paged_kv_cache, *args, **kwargs):
+            if (kwargs.get("out") is None and not kwargs.get("return_lse", False) and kwargs.get("kv_block_scales") is None
+                    and isinstance(paged_kv_cache, tuple)):
+                kwargs["out"] = torch.empty(q.shape[:-1] + (paged_kv_cache[1].shape[-1],),
+                                            dtype=getattr(self, "_cached_o_data_type", None) or q.dtype, device=q.device)
+            return base.run(self, q, paged_kv_cache, *args, **kwargs)
+
+    return _T2NoFillWrapper
+'''
+
+
+def patch_kv_nosplit(src: str) -> str:
+    """Apply bit-identical KV no-split (bs >= 35 on L40S) and uninitialized attention output allocation."""
+    if "[TRACK2-KV-NOSPLIT]" in src:
+        return src
+    anchor = "\n@triton.jit\ndef _ss_kv_meta_kernel("
+    if anchor not in src:
+        raise RuntimeError("Could not locate _ss_kv_meta_kernel in selfspec_fast_attn.py")
+    src = src.replace(anchor, KV_NOSPLIT_HEADER + "\n" + anchor, 1)
+
+    repls = [
+        (
+            '        self._Wrapper = BatchPrefillWithPagedKVCacheWrapper\n',
+            '        # [TRACK2-ATTN-NOFILL]\n'
+            '        self.t2_nofill = _T2_ATTN_NOFILL\n'
+            '        self._Wrapper = (_t2_nofill_wrapper(BatchPrefillWithPagedKVCacheWrapper) if self.t2_nofill\n'
+            '                         else BatchPrefillWithPagedKVCacheWrapper)\n',
+        ),
+        (
+            '        assert backend.page_size == 1, "SELFSPEC_FASTATTN requires --page-size 1"\n',
+            '        assert backend.page_size == 1, "SELFSPEC_FASTATTN requires --page-size 1"\n'
+            '        # [TRACK2-KV-NOSPLIT] graph wrappers with T * (bs + 1) > split_bound plan without KV split\n'
+            '        self.t2_nosplit = _T2_KV_NOSPLIT\n'
+            '        self.t2_split_bound = (2 * int(torch.cuda.get_device_properties(self.device).multi_processor_count)) // self.num_kv_heads\n'
+            '        self.t2_ns_graphs: Dict[str, list] = {"nosplit": [], "split": []}\n'
+            '        self._t2_ns_reported = False\n'
+            '        self._t2_chk = None\n'
+            '        self.n_one_chunk_checked = 0\n'
+            '        logger.info(f"[track2-kv-nosplit] {\'ON\' if self.t2_nosplit else \'OFF\'}: split bound {self.t2_split_bound}")\n',
+        ),
+        (
+            '    def _split_args(self, graph: bool):\n'
+            '        # a fixed split size under CUDA graphs changes split_kv / the plan-info layout vs the captured one -> eager only (warned\n'
+            '        # once at startup)\n'
+            '        fixed = self.fixed_split if (self.fixed_split > 0 and not graph and not self.no_split) else -1\n'
+            '        return fixed, self.no_split\n',
+            '    def _split_args(self, w):\n'
+            '        no_split = self.no_split or getattr(w, "_ss_no_split", False)\n'
+            '        fixed = self.fixed_split if (self.fixed_split > 0 and not w.is_cuda_graph_enabled and not no_split) else -1\n'
+            '        return fixed, no_split\n'
+            '\n'
+            '    # ------------------------------------------------------------------ [TRACK2-KV-NOSPLIT]\n'
+            '    def _t2_nosplit_ok(self, bs: int, n: int) -> bool:\n'
+            '        if not self.t2_nosplit:\n'
+            '            return False\n'
+            '        group = self.num_qo_heads // self.num_kv_heads\n'
+            '        if not ((bs * n - bs + 1) * group > 64 and self.head_dim < 256):\n'
+            '            return False\n'
+            '        tiles = -(-(n * group) // 128)\n'
+            '        return tiles * (bs + 1) > self.t2_split_bound\n'
+            '\n'
+            '    def _t2_tiles(self, info, bs: int, n: int) -> int:\n'
+            '        return bs * (-(-(n * (self.num_qo_heads // self.num_kv_heads)) // int(info[3])))\n'
+            '\n'
+            '    def _t2_layout_ok(self, info, bs: int, n: int) -> bool:\n'
+            '        info = [int(x) for x in info]\n'
+            '        return info[13] == 1 and info[14] == 0 and 0 < self._t2_tiles(info, bs, n) <= info[0]\n'
+            '\n'
+            '    def _t2_run_info(self, raw, bs: int, n: int):\n'
+            '        import tvm_ffi\n'
+            '        info = [int(x) for x in raw]\n'
+            '        if not self._t2_layout_ok(info, bs, n):\n'
+            '            raise RuntimeError(f"[track2-kv-nosplit] bs={bs}: unexpected no-split graph plan info {info}")\n'
+            '        info[0] = self._t2_tiles(info, bs, n)\n'
+            '        return tvm_ffi.convert(info)\n'
+            '\n'
+            '    def _t2_check_one_chunk(self, st: _RoleState, w, role: str, bs: int):\n'
+            '        if self._t2_chk is None:\n'
+            '            ws = torch.empty((8 * 1024 * 1024,), dtype=torch.uint8, device=self.device)\n'
+            '            self._t2_chk = (ws, torch.empty(ws.shape, dtype=torch.uint8, device="cpu", pin_memory=True))\n'
+            '        int_ws, pinned = self._t2_chk\n'
+            '        n = st.n\n'
+            '        torch.cuda.synchronize()\n'
+            '        info = [int(x) for x in w._cached_module.plan(\n'
+            '            w._float_workspace_buffer, int_ws, pinned, st.qo(n)[0][: bs + 1], st.kv_indptr_host[: bs + 1], st.kvl_host[:bs],\n'
+            '            w._max_total_num_rows or bs * n, bs, self.num_qo_heads, self.num_kv_heads, 1, True, self.head_dim, self.head_dim,\n'
+            '            False, -1, -1, False, 0)]\n'
+            '        host = pinned.numpy()\n'
+            '        rows = bs * n\n'
+            '        mi = np.frombuffer(host[info[7] : info[7] + 4 * (rows + 1)].tobytes(), dtype=np.int32)\n'
+            '        chunk = int(np.frombuffer(host[info[9] : info[9] + 4].tobytes(), dtype=np.int32)[0])\n'
+            '        if info[14] != 1 or not bool((np.diff(mi) == 1).all()) or chunk < int(st.kvl_np[:bs].max()):\n'
+            '            raise RuntimeError(f"[track2-kv-nosplit] {role} bs={bs}: stock split plan has >1 KV chunk/req")\n'
+            '        self.n_one_chunk_checked += 1\n',
+        ),
+        (
+            '        fixed, no_split = self._split_args(graph)\n'
+            '        n = st.n\n'
+            '        self._wait_pinned(st)\n'
+            '        w._plan_info = w._cached_module.plan(\n',
+            '        fixed, no_split = self._split_args(w)\n'
+            '        n = st.n\n'
+            '        self._wait_pinned(st)\n'
+            '        raw = w._cached_module.plan(\n',
+        ),
+        (
+            '        w._qo_indptr_last = bs * n\n'
+            '        w._batch_size = bs\n',
+            '        w._qo_indptr_last = bs * n\n'
+            '        w._batch_size = bs\n'
+            '        if graph and no_split:\n'
+            '            run = getattr(w, "_ss_run_info", None)\n'
+            '            if run is None:\n'
+            '                run = w._ss_run_info = self._t2_run_info(raw, bs, n)\n'
+            '            w._plan_info = run\n'
+            '        else:\n'
+            '            w._plan_info = raw\n'
+            '        return raw\n',
+        ),
+        (
+            '        fixed, no_split = self._split_args(w.is_cuda_graph_enabled)\n',
+            '        fixed, no_split = self._split_args(w)\n',
+        ),
+        (
+            '    def _check(self, where, role, bs, w, ref):\n'
+            '        got = list(w._plan_info)\n',
+            '    def _check(self, where, role, bs, raw, ref):\n'
+            '        got = list(raw)\n',
+        ),
+        (
+            '        self._cpp_plan(st, w, bs)\n'
+            '        if ref is not None:\n'
+            '            self._check(where, role, bs, w, ref)\n'
+            '            self.n_checked += 1\n'
+            '            if self.n_checked in (1, 10, 100, 1000) or self.n_checked % 10000 == 0:\n'
+            '                logger.info(f"[selfspec-check] {self.n_checked} fast-path plans checked (metadata + plan info), 0 mismatches")\n',
+            '        raw = self._cpp_plan(st, w, bs)\n'
+            '        if ref is not None:\n'
+            '            self._check(where, role, bs, raw, ref)\n'
+            '            if w.is_cuda_graph_enabled and getattr(w, "_ss_no_split", False):\n'
+            '                self._t2_check_one_chunk(st, w, role, bs)\n'
+            '            self.n_checked += 1\n'
+            '            if self.n_checked in (1, 10, 100, 1000) or self.n_checked % 10000 == 0:\n'
+            '                logger.info(f"[selfspec-check] {self.n_checked} fast-path plans checked (metadata + plan info), 0 mismatches")\n'
+            '        return raw\n',
+        ),
+        (
+            '        if ref is not None:\n'
+            '            self._cpp_plan(st, w, bs)\n'
+            '            self._check("eager", role, bs, w, ref)\n',
+            '        if ref is not None:\n'
+            '            self._check("eager", role, bs, self._cpp_plan(st, w, bs), ref)\n',
+        ),
+        (
+            '        ref = self._python_plan(st, w, bs)\n'
+            '        self._cpp_plan(st, w, bs)\n'
+            '        self._check("capture", role, bs, w, ref)\n'
+            '        self.graph_wrappers[(bs, role)] = w\n'
+            '        self.capture_info[(bs, role)] = tuple(int(x) for x in w._plan_info)\n',
+            '        w._ss_no_split = self._t2_nosplit_ok(bs, n)\n'
+            '        ref = self._python_plan(st, w, bs)\n'
+            '        if w._ss_no_split and not self._t2_layout_ok(ref, bs, n):\n'
+            '            logger.warning(f"[track2-kv-nosplit] {role} bs={bs}: unexpected no-split plan {ref}: stock split plan")\n'
+            '            w._ss_no_split = False\n'
+            '            ref = self._python_plan(st, w, bs)\n'
+            '        raw = self._cpp_plan(st, w, bs)\n'
+            '        self._check("capture", role, bs, raw, ref)\n'
+            '        self.graph_wrappers[(bs, role)] = w\n'
+            '        self.capture_info[(bs, role)] = tuple(int(x) for x in raw)\n'
+            '        no_split = bool(self._split_args(w)[1])\n'
+            '        self.t2_ns_graphs["nosplit" if no_split else "split"].append((bs, role))\n'
+            '        if no_split:\n'
+            '            self._once(("t2-nosplit", role), f"[track2-kv-nosplit] {role} bs={bs}: graph without KV split, "\n'
+            '                                             f"{int(w._plan_info[0])} CTAs/KV-head (raw {int(raw[0])})")\n',
+        ),
+        (
+            '        self._plan_checked(st, w, role, bs, "replay")\n'
+            '        self._check_capture_layout(w, role, bs)\n',
+            '        raw = self._plan_checked(st, w, role, bs, "replay")\n'
+            '        self._check_capture_layout(raw, role, bs)\n'
+            '        if not self._t2_ns_reported:\n'
+            '            self._t2_ns_reported = True\n'
+            '            ns, sp = (sorted({b for b, _ in self.t2_ns_graphs[k]}) for k in ("nosplit", "split"))\n'
+            '            print(f"[track2-kv-nosplit] {\'ON\' if self.t2_nosplit else \'OFF\'}: {len(self.t2_ns_graphs[\'nosplit\'])} no-split "\n'
+            '                  f"(bs {ns}), {len(self.t2_ns_graphs[\'split\'])} split (bs {sp}); bound {self.t2_split_bound}; "\n'
+            '                  f"nofill={self.t2_nofill}", flush=True)\n',
+        ),
+        (
+            '    def _check_capture_layout(self, w, role: str, bs: int):\n'
+            '        """the replay plan info must be the capture\'s (the graph\'s kernels read the int workspace at its offsets): 3 layout fields on\n'
+            '        every replay, all 15 on the first 64 replays of the wrapper, every 1024th, and always with SELFSPEC_CHECK=1."""\n'
+            '        key = (bs, role)\n'
+            '        cap = self.capture_info[key]\n'
+            '        pi = w._plan_info\n',
+            '    def _check_capture_layout(self, pi, role: str, bs: int):\n'
+            '        """the replay plan info must be the capture\'s (the graph\'s kernels read the int workspace at its offsets): 3 layout fields on\n'
+            '        every replay, all 15 on the first 64 replays of the wrapper, every 1024th, and always with SELFSPEC_CHECK=1."""\n'
+            '        key = (bs, role)\n'
+            '        cap = self.capture_info[key]\n',
+        ),
+    ]
+    for i, (old, new) in enumerate(repls):
+        if src.count(old) != 1:
+            raise RuntimeError(f"patch_kv_nosplit hunk {i} expected 1 match, got {src.count(old)}: {old[:80]!r}")
+        src = src.replace(old, new, 1)
+    return src
+
+
 def patch_draft_kernel(src: str) -> str:
     """Route the draft role's wrappers (eager + captured) through the load-free seed-mask module (sub-agent audit)."""
     if "[TRACK2-DRAFT-KERNEL]" in src:
-        return src
+        return patch_kv_nosplit(src)
     anchor = "\nclass _RoleState:"
     if anchor not in src:
         raise RuntimeError("Could not locate _RoleState in selfspec_fast_attn.py")
@@ -232,7 +455,7 @@ def patch_draft_kernel(src: str) -> str:
     if src.count(old) != 1:
         raise RuntimeError("Could not locate the captured wrapper's _share_int_ws")
     src = src.replace(old, new, 1)
-    return src
+    return patch_kv_nosplit(src)
 
 
 def main() -> None:

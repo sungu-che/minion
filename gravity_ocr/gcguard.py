@@ -25,6 +25,7 @@ def freeze(tag: str) -> bool:
     if os.environ.get("TRACK2_GC_FREEZE", "1") != "1":
         return False
     try:
+        gc.collect()
         gc.freeze()
         gc.disable()
         print(f"[track2-gc] {tag} (pid {os.getpid()}): {gc.get_freeze_count()} objects frozen, automatic GC off", flush=True)

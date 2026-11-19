@@ -86,17 +86,43 @@ def _t2_get_lm_head_cache(lm_head, vocab_size: int):
                 W_core = W[core_ids.long()].contiguous()
                 break
 
+    fp8_mode = _t2_os.environ.get("TRACK2_FP8_LM_HEAD", "off").strip().lower()
+    fp8_f16 = _t2_os.environ.get("TRACK2_FP8_LM_HEAD_F16", "0") == "1"
+    fp8_mod = None
+    W_fp8_t = None
+    W_fp8_scale = None
+    W_bf16_t = None
+    if fp8_mode in ("draft", "both", "bf16"):
+        try:
+            from gravity_ocr import fp8_lm_head as _t2_flh
+            fp8_mod = _t2_flh
+            if fp8_mode in ("draft", "both"):
+                W_fp8_t, W_fp8_scale = _t2_flh.quantize_weight_fp8(W_pad, f16_acc=fp8_f16)
+            if fp8_mode == "bf16":
+                W_bf16_t = W_pad.t()
+        except Exception as _e:
+            print(f"[track2-k3-lm-head] fp8_lm_head init failed ({{_e}}): falling back to BF16", flush=True)
+            fp8_mode = "off"
+            fp8_mod = None
+
     cache = {{
         "cuda": _t2_cuda,
         "W_pad": W_pad,
         "V_valid": v_full,
         "W_core": W_core,
         "core_ids": core_ids,
+        "fp8_mode": fp8_mode,
+        "fp8_f16": fp8_f16,
+        "fp8_mod": fp8_mod,
+        "W_fp8_t": W_fp8_t,
+        "W_fp8_scale": W_fp8_scale,
+        "W_bf16_t": W_bf16_t,
+        "fp8_a0": _t2_os.environ.get("TRACK2_FP8_A0", "0") == "1",
     }}
     lm_head._t2_k3_cache = cache
     print(
         f"[track2-k3-lm-head] ON: V_valid={{v_full}} W_pad={{tuple(W_pad.shape)}} "
-        f"W_core={{None if W_core is None else tuple(W_core.shape)}}",
+        f"W_core={{None if W_core is None else tuple(W_core.shape)}} fp8_mode={{fp8_mode}} f16_acc={{fp8_f16}}",
         flush=True,
     )
     return cache
@@ -132,6 +158,8 @@ def _t2_get_lm_head_cache(lm_head, vocab_size: int):
                     _cuda = _k3["cuda"]
                     _W_pad = _k3["W_pad"]
                     _V_valid = _k3["V_valid"]
+                    _fm = _k3["fp8_mode"]
+                    _fmod = _k3["fp8_mod"]
                     if _role == "draft" and _k3["W_core"] is not None:
                         _K = int(_spec.draft_token_num)
                         _sub = _t2_F.linear(hidden_states, _k3["W_core"])
@@ -145,6 +173,21 @@ def _t2_get_lm_head_cache(lm_head, vocab_size: int):
                             _lg0, None, check_cs=False, v_valid=_V_valid
                         )
                         _am_i32[0::_K] = _a0_i32
+                    elif _fmod is not None and _fm == "bf16":
+                        _am_i32 = _fmod.fused_bf16_argmax(hidden_states, _k3["W_bf16_t"], _V_valid)
+                    elif _fmod is not None and (_fm == "both" or (_fm == "draft" and _role == "draft")):
+                        _am_i32 = _fmod.fused_fp8_argmax(
+                            hidden_states, _k3["W_fp8_t"], _k3["W_fp8_scale"], _V_valid, f16_acc=_k3["fp8_f16"]
+                        )
+                        if _role == "draft" and not _k3["fp8_a0"]:
+                            # Exact BF16 argmax for a0 (row 0 of each request: committed unconditionally)
+                            _K = int(_spec.draft_token_num)
+                            _h0 = hidden_states[0::_K].contiguous()
+                            _lg0 = _t2_F.linear(_h0, _W_pad)
+                            _a0_i32, _, _ = _cuda.bf16_argmax_cs(
+                                _lg0, None, check_cs=False, v_valid=_V_valid
+                            )
+                            _am_i32[0::_K] = _a0_i32
                     else:
                         _lg = _t2_F.linear(hidden_states, _W_pad)
                         _am_i32, _, _ = _cuda.bf16_argmax_cs(
@@ -230,21 +273,47 @@ def patch_worker(src: str) -> str:
 
 
 def patch_ngram_info(src: str) -> str:
-    if NGRAM_MARKER in src:
-        return src
-    target = """        bs = batch.batch_size()
+    if NGRAM_MARKER not in src:
+        target = """        bs = batch.batch_size()
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, self.draft_token_num)"""
-    repl = f"""        {NGRAM_MARKER}
+        repl = f"""        {NGRAM_MARKER}
         bs = batch.batch_size()
         _raw_lg = logits_output.next_token_logits
         if _raw_lg.shape[-1] == 1 and _raw_lg.dtype == torch.int32:
             target_predict = _raw_lg.reshape(bs, self.draft_token_num).to(torch.int64)
         else:
             target_predict = torch.argmax(_raw_lg, dim=-1).reshape(bs, self.draft_token_num)"""
-    if target not in src:
-        raise RuntimeError("Could not find _greedy_verify argmax block in ngram_info.py")
-    return src.replace(target, repl, 1)
+        if target not in src:
+            raise RuntimeError("Could not find _greedy_verify argmax block in ngram_info.py")
+        src = src.replace(target, repl, 1)
+
+    if "[TRACK2-JIT-STABLE]" not in src:
+        anchor = "if is_cuda():"
+        if anchor not in src:
+            raise RuntimeError("Could not find is_cuda() block in ngram_info.py")
+        helper = """# [TRACK2-JIT-STABLE] fixed bs_upper constexpr for assign_req_to_token_pool (no tail-batch lazy Triton compiles)
+_T2_BS_UPPER = (
+    triton.next_power_of_2(max(2, int(__import__("os").environ.get("MAXREQ", "96") or 96)))
+    if __import__("os").environ.get("TRACK2_JIT_STABLE", "1") == "1"
+    else 0
+)
+
+
+def _t2_bs_upper(bs: int) -> int:
+    return max(_T2_BS_UPPER, triton.next_power_of_2(bs))
+
+
+"""
+        src = src.replace(anchor, helper + anchor, 1)
+        old_call = """            batch.req_to_token_pool.req_to_token.shape[1],
+            triton.next_power_of_2(bs),"""
+        new_call = """            batch.req_to_token_pool.req_to_token.shape[1],
+            _t2_bs_upper(bs),  # [TRACK2-JIT-STABLE]"""
+        if src.count(old_call) < 2:
+            raise RuntimeError(f"Expected >= 2 assign_req_to_token_pool calls in ngram_info.py, found {src.count(old_call)}")
+        src = src.replace(old_call, new_call)
+    return src
 
 
 def patch_cuda_graph_runner(src: str) -> str:

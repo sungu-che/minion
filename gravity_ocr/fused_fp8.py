@@ -31,6 +31,9 @@ _MLP = _ON and os.environ.get("TRACK2_FUSED_MLP", "1") == "1"
 _MROPE = _ON and os.environ.get("TRACK2_FUSED_MROPE", "1") == "1"
 _NORM = _ON and os.environ.get("TRACK2_FUSED_NORM", "1") == "1"
 _CHAIN = os.environ.get("TRACK2_FUSED_CHAIN", "1") == "1"
+_F16ACC = os.environ.get("TRACK2_F16ACC", "off").strip().lower()
+_F16_VIT = _F16ACC in ("vit", "all", "1")
+_F16_LM = _F16ACC in ("lm", "all", "1")
 _VERIFY = os.environ.get("TRACK2_FUSED_VERIFY", "0") == "1"
 _VERIFY_N = int(os.environ.get("TRACK2_FUSED_VERIFY_N", "6"))
 _INSTALLED = False
@@ -144,7 +147,11 @@ def _install_mrope() -> bool:
         self._match_cos_sin_cache_dtype(query)
         if F.supported(query, key, self.cos_sin_cache, positions, self.mrope_section, self.head_size, self.rotary_dim,
                        self.mrope_interleaved, self.mrope_interleaved_glm, self.is_neox_style):
-            F.mrope_inplace(query, key, self.cos_sin_cache, positions, self.mrope_section, self.head_size, self.rotary_dim)
+            # When query is a strided slice of qkv, write rotated query directly to a contiguous tensor so
+            # FlashInferAttnBackend.forward_extend's `q = q.contiguous()` becomes a zero-cost no-op (-30ms/job).
+            q_out = torch.empty(query.shape, dtype=query.dtype, device=query.device) if not query.is_contiguous() else None
+            query = F.mrope_inplace(query, key, self.cos_sin_cache, positions, self.mrope_section, self.head_size,
+                                    self.rotary_dim, q_out=q_out)
             return query, key
         return orig(self, positions, query, key)
 
@@ -157,11 +164,15 @@ def _install_norm(C) -> int:
     bitwise), feeding the same fp8_scaled_mm calls apply_fp8_linear would make; chained across layers (module doc)."""
     from sglang.srt.layers.quantization import fp8_utils as fu
     from sglang.srt.models import glm4, glm_ocr
+    from gravity_ocr import fp8_gemm as _G
 
     scaled_mm = fu.fp8_scaled_mm
 
     def lin(layer, q8, s, dtype):
         return scaled_mm(q8, layer.weight, s, layer.weight_scale, out_dtype=dtype, bias=layer.bias)
+
+    def lin_f16(layer, q8, s, dtype):
+        return _G.mm_f16(q8, layer.weight, s, layer.weight_scale, out_dtype=dtype, bias=layer.bias)
 
     n = 0
     L = glm4.Glm4DecoderLayer
@@ -183,31 +194,78 @@ def _install_norm(C) -> int:
                 if pend is not None:
                     hidden_states = pend(hidden_states)  # the previous layer's post_mlp_layernorm, as SGLang runs it
                 return orig_l(self, positions, hidden_states, forward_batch, residual)
+            use_f16 = getattr(self, "_t2_f16_lm", None)
+            if use_f16 is None:
+                if _F16_LM and not torch.cuda.is_current_stream_capturing() and _down_ok(at.o_proj):
+                    _G.rescale_f16_weight(at.qkv_proj)
+                    _G.rescale_f16_weight(at.o_proj)
+                    _G.rescale_f16_weight(mlp.gate_up_proj)
+                    _G.rescale_f16_weight(mlp.down_proj)
+                    use_f16 = True
+                    if not getattr(L, "_t2_f16_logged", False):
+                        L._t2_f16_logged = True
+                        print("[track2-f16acc] LM ON (QNT=3, shift=32, mma.f16.e4m3)", flush=True)
+                else:
+                    use_f16 = False
+                self._t2_f16_lm = use_f16
+            nq_div = (C.NORM_DIV | 2) if use_f16 else None
+            smq_qnt = 3 if use_f16 else None
+            lin_fn = lin_f16 if use_f16 else lin
             dt = hidden_states.dtype
             ln = self.input_layernorm
             if residual is None:
                 residual = hidden_states
-                q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, mode=C.NORM_MODE_PLAIN)
+                q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, mode=C.NORM_MODE_PLAIN, div=nq_div)
             elif pend is not None:
                 # == previous layer's post_mlp_layernorm(down), then fused_add_rmsnorm(., residual) of this layer
                 q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, residual=residual,
-                                         mode=C.NORM_MODE_PRE_ADD, weight0=pend.weight, eps0=pend.variance_epsilon)
+                                         mode=C.NORM_MODE_PRE_ADD, weight0=pend.weight, eps0=pend.variance_epsilon, div=nq_div)
             else:
                 # == fused_add_rmsnorm(hidden_states, residual): residual += hidden_states (in place); the normalized rows
                 # go straight to FP8 (SGLang also overwrote hidden_states with them; nothing reads that buffer again)
                 q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, residual=residual,
-                                         mode=C.NORM_MODE_ADD)
-            qkv = lin(at.qkv_proj, q8, s, dt)
+                                         mode=C.NORM_MODE_ADD, div=nq_div)
+            qkv = lin_fn(at.qkv_proj, q8, s, dt)
             q, k, v = qkv.split([at.q_size, at.kv_size, at.kv_size], dim=-1)
-            q, k = at.rotary_emb(positions, q, k)
-            o, _ = at.o_proj(at.attn(q, k, v, forward_batch))
+            _saved_kv = False
+            if (_MROPE and os.environ.get("TRACK2_FUSED_MROPE_KV", "1") == "1"
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not getattr(at.attn, "is_cross_attention", False)
+                    and not getattr(getattr(forward_batch.attn_backend, "forward_metadata", None), "use_ragged", True)
+                    and getattr(at.attn, "k_scale", None) is None
+                    and getattr(at.attn, "v_scale", None) is None):
+                from gravity_ocr import fast_mrope as _F
+                _re = at.rotary_emb
+                _re._match_cos_sin_cache_dtype(q)
+                _kvp = forward_batch.token_to_kv_pool
+                _lid = at.attn.layer_id - _kvp.start_layer
+                _kc = _kvp.k_buffer[_lid]
+                _vc = _kvp.v_buffer[_lid]
+                if (_kvp.dtype == dt and _kvp.store_dtype == dt and _kc.stride(-1) == 1 and _vc.stride(-1) == 1
+                        and _kc.stride(-2) == _re.head_size and _vc.stride(-2) == _re.head_size
+                        and v.stride(-1) == 1 and forward_batch.out_cache_loc is not None
+                        and _F.supported(q, k, _re.cos_sin_cache, positions, _re.mrope_section, _re.head_size,
+                                         _re.rotary_dim, _re.mrope_interleaved, _re.mrope_interleaved_glm, _re.is_neox_style)):
+                    q = _F.mrope_kv_scatter(
+                        q, k, v, _kc, _vc, forward_batch.out_cache_loc,
+                        _re.cos_sin_cache, positions, _re.mrope_section, _re.head_size, _re.rotary_dim,
+                    )
+                    _saved_kv = True
+            if not _saved_kv:
+                q, k = at.rotary_emb(positions, q, k)
+            ao = at.attn(q, k, v, forward_batch, save_kv_cache=not _saved_kv)
+            if use_f16:
+                q8, s = C.quant_fp8_rows(ao, qnt_mode=3)
+                o = lin_f16(at.o_proj, q8, s, dt)
+            else:
+                o, _ = at.o_proj(ao)
             q8, s = C.norm_quant_fp8(o, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon,
                                      residual=residual, mode=C.NORM_MODE_PRE_ADD,
                                      weight0=self.post_self_attn_layernorm.weight,
-                                     eps0=self.post_self_attn_layernorm.variance_epsilon)
-            gate_up = lin(mlp.gate_up_proj, q8, s, dt)
-            q8, s = C.silu_mul_quant_fp8(gate_up)
-            down = lin(mlp.down_proj, q8, s, dt)
+                                     eps0=self.post_self_attn_layernorm.variance_epsilon, div=nq_div)
+            gate_up = lin_fn(mlp.gate_up_proj, q8, s, dt)
+            q8, s = C.silu_mul_quant_fp8(gate_up, qnt_mode=smq_qnt)
+            down = lin_fn(mlp.down_proj, q8, s, dt)
             if st is not None and _CHAIN and not getattr(self, "_t2_last", True):
                 st.pending = self.post_mlp_layernorm  # applied inside the next layer's input kernel
                 return down, residual
@@ -236,6 +294,20 @@ def _install_norm(C) -> int:
                 if pend is not None:
                     x = x + pend  # the previous block's `x_after_add + mlp_out`, as SGLang runs it
                 return orig_b(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
+            use_f16 = getattr(self, "_t2_f16_vit", None)
+            if use_f16 is None:
+                if _F16_VIT and not torch.cuda.is_current_stream_capturing():
+                    _G.rescale_f16_weight(at.qkv_proj)
+                    _G.rescale_f16_weight(mlp.gate_up_proj)
+                    use_f16 = True
+                    if not getattr(B, "_t2_f16_logged", False):
+                        B._t2_f16_logged = True
+                        print("[track2-f16acc] ViT ON (qkv + gate_up: QNT=3, shift=32, mma.f16.e4m3)", flush=True)
+                else:
+                    use_f16 = False
+                self._t2_f16_vit = use_f16
+            nq_div = (C.NORM_DIV | 2) if use_f16 else None
+            lin_fn = lin_f16 if use_f16 else lin
             S, _, H = x.shape
             x2d = x.view(S, H)
             if pend is not None:
@@ -243,11 +315,11 @@ def _install_norm(C) -> int:
                 # the sum is written into pend's buffer, which is this block's input from here on
                 p2d = pend.view(S, H)
                 q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, residual=p2d,
-                                         mode=C.NORM_MODE_ROUND_ADD)
+                                         mode=C.NORM_MODE_ROUND_ADD, div=nq_div)
                 x2d = p2d
             else:
-                q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, mode=C.NORM_MODE_PLAIN)
-            at._t2_pre_qkv = lin(at.qkv_proj, q8, s, x.dtype).view(1, S, -1)   # consumed by the patched attention forward
+                q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, mode=C.NORM_MODE_PLAIN, div=nq_div)
+            at._t2_pre_qkv = lin_fn(at.qkv_proj, q8, s, x.dtype).view(1, S, -1)   # consumed by the patched attention forward
             attn = at(x2d.view(1, S, H), cu_seqlens=cu_seqlens, rotary_pos_emb_cos=rotary_pos_emb_cos,
                       rotary_pos_emb_sin=rotary_pos_emb_sin)
             at.__dict__.pop("_t2_pre_qkv", None)
@@ -256,8 +328,8 @@ def _install_norm(C) -> int:
                 attn2d = attn2d.contiguous()
             # == norm2(x2d, residual=attn2d): attn2d <- x + attn (x_after_add), normalized rows -> FP8
             q8, s = C.norm_quant_fp8(x2d, self.norm2.weight, self.norm2.variance_epsilon, residual=attn2d,
-                                     mode=C.NORM_MODE_ADD)
-            gate_up = lin(mlp.gate_up_proj, q8, s, x.dtype)
+                                     mode=C.NORM_MODE_ADD, div=nq_div)
+            gate_up = lin_fn(mlp.gate_up_proj, q8, s, x.dtype)
             q8, s = C.silu_mul_quant_fp8(gate_up)
             mlp_out = lin(mlp.down_proj, q8, s, x.dtype)
             if st is not None and _CHAIN and not getattr(self, "_t2_last", True):

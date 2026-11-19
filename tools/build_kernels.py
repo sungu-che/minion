@@ -140,6 +140,23 @@ def crate_lib(crate: Path) -> str:
     return "gravity_kernels" if crate.name == "rust_kernels" else "gravity_gpu"
 
 
+def build_cpu_prep(env: dict) -> Path | None:
+    """libtrack2_cpu_prep.so: fast C glyph_size, margin_crop ink_box, single-pass crop->shm CHW copy."""
+    src = ROOT / "rust_gpu" / "kernels" / "track2_cpu_prep.c"
+    if not src.is_file():
+        return None
+    cc = shutil.which("gcc") or shutil.which("cc")
+    if not cc:
+        print("  warning: gcc not found; libtrack2_cpu_prep.so not built")
+        return None
+    out = OUT / "libtrack2_cpu_prep.so"
+    cmd = [cc, "-O3", "-shared", "-fPIC", "-o", str(out), str(src), "-lm"]
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True, env=env)
+    print(f"  -> {out}")
+    return out
+
+
 def build_cuda_sm89(env: dict) -> Path | None:
     """libtrack2_cuda_sm89.so: the live sm_89 kernels of the SGLang path (patchify, K2, fused FP8 norm / SiLU / quant,
     argmax). Plain nvcc, no cargo; written straight into gravity_ocr/_native (the serving path refuses a stale build:
@@ -175,6 +192,8 @@ def main() -> None:
     if args.gpu != "none" and ("cuda" in [f.strip() for f in args.gpu.split(",")]
                                or (args.gpu == "auto" and cuda_root() is not None)):
         build_cuda_sm89(env)
+    if sys.platform != "win32":
+        build_cpu_prep(env)
     if args.gpu != "none" and have_cargo:
         if args.gpu == "auto":
             feats = ["vulkan"]

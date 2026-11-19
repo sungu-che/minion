@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import signal
@@ -43,7 +44,7 @@ URL = f"http://127.0.0.1:{PORT}"
 MAX_TOKENS = 4096
 
 STAGE = int(os.environ.get("TRACK2_STAGE", "3"))
-CONCURRENCY = int(os.environ.get("TRACK2_CONCURRENCY", os.environ.get("CONCURRENCY", "96" if STAGE >= 1 else "48")))
+CONCURRENCY = int(os.environ.get("TRACK2_CONCURRENCY", os.environ.get("CONCURRENCY", "160" if STAGE >= 1 else "48")))
 # In-flight HTTP requests. The server still runs at most MAXREQ (= CONCURRENCY) at once; sending every crop up front
 # lets the tokenizer decode all images while the GPU works and keeps SGLang's waiting queue full, so prefill batches are
 # large (efficient ViT / extend) instead of one crop per freed slot.
@@ -69,6 +70,9 @@ IPC_MODE = "shm_symlink" if USE_SHM_IPC else "png_b64"
 DIRECT_FILE_URL = os.environ.get("TRACK2_DIRECT_FILE_URL", "1") == "1"
 # fsync of predictions.jsonl before DONE: not needed for other processes to read the file
 FSYNC_PREDICTIONS = os.environ.get("TRACK2_FSYNC_PREDICTIONS", "0") == "1"
+# Request ordering: "dens" (longest predicted decode rounds / area^beta, output-neutral), "rounds", "area", "text"
+ORDER = os.environ.get("TRACK2_ORDER", "v2f:0.05")
+ORDER_BETA = float(os.environ.get("TRACK2_ORDER_BETA", "0.25"))
 _JOB_NO = 0
 
 TASK_PROMPTS = {
@@ -411,6 +415,77 @@ def build_image_url(img_path: Path, idx: int, mode: str) -> str:
     return "data:image/png;base64," + base64.b64encode(img_path.read_bytes()).decode("ascii")
 
 
+_ROUNDS_DEFAULT = {"table": 17.0, "text": 5.0, "formula": 3.0}
+
+
+def predict_rounds(task_key: str, w: int, h: int, fsize: int) -> float:
+    """Decode rounds of a crop predicted from header dims + PNG byte size (no pixel decode)."""
+    if w <= 0 or h <= 0 or fsize <= 0:
+        return _ROUNDS_DEFAULT.get(task_key, 5.0)
+    lf, lw, lh = math.log(fsize), math.log(w), math.log(h)
+    if task_key == "table":
+        y = 0.1674 + 0.2405 * lf
+    elif task_key == "formula":
+        y = -0.5223 + 0.4775 * lw - 0.1927 * lh
+    else:
+        y = -0.2399 + 0.4344 * lf - 0.3644 * lw
+    return max(0.0, math.expm1(min(y, 6.0)))
+
+
+def predict_rounds_v2(task_key: str, w: int, h: int, fsize: int) -> float:
+    """Monotonic 2-feature (log fsize + log area) output-length proxy (5-fold CV on dev; non-negative weights)."""
+    if w <= 0 or h <= 0 or fsize <= 0:
+        return _ROUNDS_DEFAULT.get(task_key, 5.0) * 40.0
+    lf = math.log(fsize)
+    la = math.log(w * h)
+    if task_key == "table":
+        y = 3.28 + 0.20 * lf + 0.08 * la
+    elif task_key == "formula":
+        y = -1.23 + 0.50 * la
+    else:
+        y = -2.61 + 0.37 * lf + 0.29 * la
+    return math.exp(min(y, 9.0))
+
+
+def order_items(prepared: list[dict[str, Any]], order: str) -> list[dict[str, Any]]:
+    beta = ORDER_BETA
+    if ":" in order:
+        order, _, b = order.partition(":")
+        try:
+            beta = float(b)
+        except ValueError:
+            order = "area"
+    if order in ("v2", "v2f"):
+        # Monotonic LPT order; "v2f" puts SEND_FIRST small-area high-work crops first so ViT finishes in <8ms at t=0,
+        # then orders the rest by descending predicted work / area^beta (default beta=0.05 -> zero big-table tail).
+        def lpt_v2(x: dict[str, Any], b_: float) -> float:
+            return -x["pred2"] / (max(x["area"], 1) ** b_)
+
+        if order == "v2f" and len(prepared) > SEND_FIRST:
+            by_fast = sorted(prepared, key=lambda x: lpt_v2(x, 0.35))
+            head = by_fast[:SEND_FIRST]
+            head_ids = {id(x) for x in head}
+            tail = sorted((x for x in prepared if id(x) not in head_ids), key=lambda x: lpt_v2(x, beta))
+            return head + tail
+        return sorted(prepared, key=lambda x: lpt_v2(x, beta))
+    if order in ("rounds", "rounds_fl", "dens", "dens_fl", "text"):
+        if order.startswith("rounds"):
+            beta = 0.0
+
+        def lpt(x: dict[str, Any]) -> float:
+            return -x["pred"] / (max(x["area"], 1) ** beta)
+
+        if order == "text":
+            base = order_items(prepared, "area")
+            texts = iter(sorted((x for x in base if x["bucket_rank"] == 1), key=lpt))
+            return [next(texts) if x["bucket_rank"] == 1 else x for x in base]
+        if order.endswith("_fl"):
+            return sorted(prepared, key=lambda x: (x["bucket_rank"] == 2, lpt(x)))
+        return sorted(prepared, key=lpt)
+    tsign = -1 if os.environ.get("TRACK2_TABLE_ORDER", "asc") == "desc" else 1
+    return sorted(prepared, key=lambda x: (x["bucket_rank"], (tsign if x["bucket_rank"] == 0 else -1) * x["area"]))
+
+
 def prepare_job_items(items: list[dict[str, Any]], folder: Path, mode: str) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     root = folder.resolve()  # once: the per-item resolve() was a syscall chain per crop
@@ -444,15 +519,13 @@ def prepare_job_items(items: list[dict[str, Any]], folder: Path, mode: str) -> l
             "bytes": nbytes,
             "w": w,
             "h": h,
+            "pred": predict_rounds(task_key, w, h, nbytes),
+            "pred2": predict_rounds_v2(task_key, w, h, nbytes),
             "prompt": prompt_str,
             "image_url": image_url,
         })
     if STAGE >= 1:
-        # Two-stage flow shop (ViT, then decode; the ViT stream is the bottleneck early on). Johnson's rule: jobs whose
-        # decode work exceeds their ViT work (tables: long HTML) first, in INCREASING ViT cost so decode fills up fast;
-        # then the rest (texts, then formulas) in decreasing size. TRACK2_TABLE_ORDER=desc restores largest-first.
-        tsign = -1 if os.environ.get("TRACK2_TABLE_ORDER", "asc") == "desc" else 1
-        prepared.sort(key=lambda x: (x["bucket_rank"], (tsign if x["bucket_rank"] == 0 else -1) * x["area"]))
+        prepared = order_items(prepared, ORDER)
     return prepared
 
 

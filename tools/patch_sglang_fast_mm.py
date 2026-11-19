@@ -75,6 +75,16 @@ try:
 except Exception:
     _g_textscale = None
 
+try:
+    from gravity_ocr import margin_crop as _g_margin_crop
+except Exception:
+    _g_margin_crop = None
+
+try:
+    from gravity_ocr import cpu_prep as _g_cpu_prep
+except Exception:
+    _g_cpu_prep = None
+
 try:  # multi-layer run log, tokenizer-manager layer (L2)
     from gravity_ocr import t2log as _T2LOG
     if _T2LOG.LEVEL < 1:
@@ -131,13 +141,18 @@ def _get_shm_ring() -> Optional[mmap.mmap]:
     return _SHM_MMAP
 
 
-def _write_shm_ring(chw: torch.Tensor) -> Optional[int]:
+def _write_shm_ring(chw: torch.Tensor, y0: int = 0, y1: int = -1, x0: int = 0, x1: int = -1) -> Optional[int]:
     """Reserve [off, off + n) under the lock, copy outside it (decode workers write in parallel); 64-byte aligned."""
     global _SHM_OFFSET
     if _get_shm_ring() is None or _SHM_NP is None:
         return None
-    src = chw.numpy().reshape(-1)
-    n = int(src.size)
+    c, h, w = chw.shape
+    if y1 < 0:
+        y1 = h
+    if x1 < 0:
+        x1 = w
+    ch, cw = y1 - y0, x1 - x0
+    n = int(c * ch * cw)
     if n <= 0 or n > SHM_RING_BYTES:
         return None
     with _SHM_LOCK:
@@ -145,12 +160,20 @@ def _write_shm_ring(chw: torch.Tensor) -> Optional[int]:
         if off + n > SHM_RING_BYTES:
             off = 0
         _SHM_OFFSET = (off + n + 63) & ~63
-    _SHM_NP[off : off + n] = src
+    if _g_cpu_prep is not None and c == 3:
+        if _g_cpu_prep.copy_crop_chw_c(chw.numpy(), y0, y1, x0, x1, int(_SHM_NP.ctypes.data) + off):
+            return off
+    sub = chw if (y0 == 0 and y1 == h and x0 == 0 and x1 == w) else chw[:, y0:y1, x0:x1]
+    if sub.is_contiguous():
+        _SHM_NP[off : off + n] = sub.numpy().reshape(-1)
+    else:
+        _SHM_NP[off : off + n].reshape(sub.shape)[:] = sub.numpy()
     return off
 
 
 def _decode_raw_chw_u8(item: Union[str, bytes, Image.Image]) -> Optional[torch.Tensor]:
-    """Decode image into contiguous `uint8 [3, H, W]` with C++ libpng/libjpeg when possible."""
+    """Decode image into `uint8 [3, H, W]` with C++ libpng/libjpeg (skips .contiguous() copy when C prep handles strides)."""
+    _no_copy = _g_cpu_prep is not None and _g_cpu_prep.load() is not None
     if isinstance(item, str):
         path = None
         if item.startswith("file://"):
@@ -162,12 +185,13 @@ def _decode_raw_chw_u8(item: Union[str, bytes, Image.Image]) -> Optional[torch.T
                 try:
                     t = read_image(path, ImageReadMode.RGB)
                     if t.dtype == torch.uint8 and t.ndim == 3 and t.shape[0] == 3:
-                        return t.contiguous()
+                        return t if _no_copy else t.contiguous()
                 except Exception:
                     pass
             with Image.open(path) as im:
                 rgb = np.ascontiguousarray(np.asarray(im.convert("RGB"), dtype=np.uint8))
-            return torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+            t = torch.from_numpy(rgb).permute(2, 0, 1)
+            return t if _no_copy else t.contiguous()
 
     if isinstance(item, bytes):
         if _HAS_TV_IO:
@@ -175,12 +199,13 @@ def _decode_raw_chw_u8(item: Union[str, bytes, Image.Image]) -> Optional[torch.T
                 buf = torch.frombuffer(bytearray(item), dtype=torch.uint8)
                 t = decode_image(buf, ImageReadMode.RGB)
                 if t.dtype == torch.uint8 and t.ndim == 3 and t.shape[0] == 3:
-                    return t.contiguous()
+                    return t if _no_copy else t.contiguous()
             except Exception:
                 pass
         with Image.open(io.BytesIO(item)) as im:
             rgb = np.ascontiguousarray(np.asarray(im.convert("RGB"), dtype=np.uint8))
-        return torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+        t = torch.from_numpy(rgb).permute(2, 0, 1)
+        return t if _no_copy else t.contiguous()
 
     if isinstance(item, str) and item.startswith("data:image/") and ";base64," in item:
         raw = base64.b64decode(item.split(";base64,", 1)[1])
@@ -213,15 +238,22 @@ def _fast_prepare_shm_or_bf16(
     chw = _decode_raw_chw_u8(item)
     if chw is None:
         return None
-    _, h, w = chw.shape
-    th, tw = _g_preprocess.smart_resize(h, w)
+    _, h0, w0 = chw.shape
+    h, w = h0, w0
+    y0, y1, x0, x1 = 0, h0, 0, w0
     s = 1.0
-    if _g_textscale is not None and task == "text":
-        # [TRACK2-TEXT-DOWNSCALE] large-font text crops: same text, fewer ViT patches (one bicubic resample on the GPU)
+    if _g_textscale is not None and task in ("text", "table"):
+        # [TRACK2-TEXT-DOWNSCALE] glyph/pitch normalization for text & table crops (downscale large, upscale tiny)
         s, _why = _g_textscale.text_downscale(chw, task)
-        if s < 1.0:
-            sh, sw = _g_textscale.scaled_size(h, w, s)
-            th, tw = _g_preprocess.smart_resize(sh, sw)
+    if _g_margin_crop is not None and _g_margin_crop.ENABLED:
+        # [TRACK2-MARGIN-CROP] tight ink bounding box + 28 px grid snap (s decided on full crop first)
+        (y0, y1, x0, x1), _mwhy = _g_margin_crop.crop_box(chw, task, s)
+        h, w = y1 - y0, x1 - x0
+    if s != 1.0 and _g_textscale is not None:
+        sh, sw = _g_textscale.scaled_size(h, w, s)
+        th, tw = _g_preprocess.smart_resize(sh, sw)
+    else:
+        th, tw = _g_preprocess.smart_resize(h, w)
     _cap = _T2_CAP_TEXT if task == "text" else (_T2_CAP_TABLE if task == "table" else 0)  # formulas: never capped
     if _cap > 0 and (th // 14) * (tw // 14) > _cap:
         # [TRACK2-PATCH-CAP] opt-in (TRACK2_TEXT_MAX_PATCHES / TRACK2_TABLE_MAX_PATCHES): an outlier crop above the cap is
@@ -238,15 +270,17 @@ def _fast_prepare_shm_or_bf16(
     gh, gw = th // 14, tw // 14
 
     if use_shm_gpu:
-        off = _write_shm_ring(chw)
+        off = _write_shm_ring(chw, y0, y1, x0, x1)
         if off is not None:
             # 56-byte descriptor: [-99, shm_offset, nbytes, H, W, gh, gw]
-            desc = torch.tensor([[-99, off, int(chw.numel()), h, w, gh, gw]], dtype=torch.int64)
+            desc = torch.tensor([[-99, off, int(3 * h * w), h, w, gh, gw]], dtype=torch.int64)
             return desc, (gh, gw), {"decode_ms": round(1e3 * (time.perf_counter() - _t2_t0), 2), "scale": round(s, 3),
                                     "h": h, "w": w}
 
     # Fallback CPU patchify if /dev/shm unavailable
-    im = Image.fromarray(chw.permute(1, 2, 0).numpy())
+    if (y0, y1, x0, x1) != (0, h0, 0, w0):
+        chw = chw[:, y0:y1, x0:x1]
+    im = Image.fromarray(chw.permute(1, 2, 0).contiguous().numpy())
     if (th, tw) != (h, w):
         im = im.resize((tw, th), Image.BICUBIC)
     rgb = np.ascontiguousarray(np.asarray(im, dtype=np.uint8))

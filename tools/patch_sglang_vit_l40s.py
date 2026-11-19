@@ -336,12 +336,14 @@ def patch_runner_py(src: str) -> str:
 import numpy as _t2_np
 
 _T2_POS_CACHE = {}
+_T2_POS_PIN_RING = []
+_T2_POS_PIN_IDX = 0
+_T2_POS_PIN_CAP = 65536
 
 
 def _t2_rot_pos_emb(vis, grid_thw):
-    """Glm4vVisionModel.rot_pos_emb (same values and order) with the position ids built in numpy and copied from
-    page-locked memory: an async H2D. rot_pos_emb's pageable .to(device) blocks the host until the stream drains,
-    which would serialize the scheduler thread behind the ViT prefetch stream."""
+    """Glm4vVisionModel.rot_pos_emb (same values and order) with reusable page-locked staging ring (no per-batch cudaHostAlloc)."""
+    global _T2_POS_PIN_IDX
     g = grid_thw.cpu() if grid_thw.is_cuda else grid_thw
     gl = [tuple(int(v) for v in row) for row in g.tolist()]
     sm = vis.spatial_merge_size
@@ -358,7 +360,17 @@ def _t2_rot_pos_emb(vis, grid_thw):
                 _T2_POS_CACHE[(h, w)] = p
         parts.append(p if t == 1 else _t2_np.tile(p, (t, 1)))
     pos = parts[0] if len(parts) == 1 else _t2_np.concatenate(parts, axis=0)
-    pos_ids = torch.from_numpy(pos).pin_memory().to(vis.device, non_blocking=True)
+    n = int(pos.shape[0])
+    if n <= _T2_POS_PIN_CAP:
+        if not _T2_POS_PIN_RING:
+            for _ in range(4):
+                _T2_POS_PIN_RING.append(torch.empty((_T2_POS_PIN_CAP, 2), dtype=torch.int64, pin_memory=True))
+        buf = _T2_POS_PIN_RING[_T2_POS_PIN_IDX & 3]
+        _T2_POS_PIN_IDX += 1
+        buf[:n].copy_(torch.from_numpy(pos))
+        pos_ids = buf[:n].to(vis.device, non_blocking=True)
+    else:
+        pos_ids = torch.from_numpy(pos).pin_memory().to(vis.device, non_blocking=True)
     cos, sin = vis.rotary_pos_emb.get_cos_sin(max(max(h, w) for _, h, w in gl))
     return cos[pos_ids].flatten(1), sin[pos_ids].flatten(1), pos_ids
 
@@ -591,7 +603,13 @@ def _t2_get_cuda_sm89():
                 from gravity_ocr import fused_fp8 as _t2_ff
                 _t2_ff.install(self)  # self: the GlmOcr model (layer / block stacks get chained)
             except Exception as _e:
-                print(f"[track2-fused] OFF: {_e}", flush=True)"""
+                print(f"[track2-fused] OFF: {_e}", flush=True)
+            try:
+                # [TRACK2-JIT-STABLE] one compiled variant per SGLang index-copy Triton kernel (no alignment stalls)
+                from gravity_ocr import jit_stable as _t2_js
+                _t2_js.install()
+            except Exception as _e:
+                print(f"[track2-jit-stable] OFF: {_e}", flush=True)"""
     if target_lw not in src:
         raise RuntimeError("Could not locate the ViT graph capture call in load_weights")
     return src.replace(target_lw, repl_lw, 1)

@@ -553,6 +553,11 @@ __device__ __forceinline__ void t2_fp8_scale(float amax, float& s, float& sinv) 
     } else if constexpr (QNT == 1) {
         s = amax / 448.0f;
         sinv = (amax == 0.0f) ? 0.0f : 448.0f / amax;
+    } else if constexpr (QNT == 3) {
+        // Exact power-of-2 shift (448 / 16 = 28.0f): keeps 10 full octaves of normal e4m3fn with zero mantissa loss,
+        // preventing FP16 accumulator overflow in sm_89 733-TFLOPS mma.f16.e4m3.e4m3.f16 GEMMs.
+        s = amax / 28.0f;
+        sinv = (s == 0.0f) ? 0.0f : 1.0f / s;
     } else {
         s = amax * (1.0f / 448.0f);
         sinv = (s == 0.0f) ? 0.0f : 1.0f / s;
@@ -713,7 +718,7 @@ __device__ __forceinline__ float t2_rstd(const float (&h)[NB][8], float eps) {
     return t2_rsqrt_approx(__fadd_rn(mean, eps));
 }
 
-template <int NB, int RED, int DIV, int MODE, bool QUANT>
+template <int NB, int RED, int DIV, int MODE, bool QUANT, int QNT = 0>
 __global__ void __launch_bounds__(128)
 gk_norm_quant_fp8_kernel(
     const __nv_bfloat16* __restrict__ x, int64_t x_stride,
@@ -777,7 +782,7 @@ gk_norm_quant_fp8_kernel(
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
         float s, sinv;
-        t2_fp8_scale<0>(amax, s, sinv);
+        t2_fp8_scale<QNT>(amax, s, sinv);
         if (t == 0) scale[row] = s;
 #pragma unroll
         for (int b = 0; b < NB; ++b) {
@@ -835,9 +840,11 @@ int track2_silu_mul_quant_fp8(
             case 0: T2_SMQ_CASE(4, 0, 0); break;
             case 1: T2_SMQ_CASE(4, 0, 1); break;
             case 2: T2_SMQ_CASE(4, 0, 2); break;
+            case 3: T2_SMQ_CASE(4, 0, 3); break;
             case 10: T2_SMQ_CASE(4, 1, 0); break;
             case 11: T2_SMQ_CASE(4, 1, 1); break;
             case 12: T2_SMQ_CASE(4, 1, 2); break;
+            case 13: T2_SMQ_CASE(4, 1, 3); break;
             default: return 1003;
         }
     } else {
@@ -845,39 +852,42 @@ int track2_silu_mul_quant_fp8(
             case 0: T2_SMQ_CASE(6, 0, 0); break;
             case 1: T2_SMQ_CASE(6, 0, 1); break;
             case 2: T2_SMQ_CASE(6, 0, 2); break;
+            case 3: T2_SMQ_CASE(6, 0, 3); break;
             case 10: T2_SMQ_CASE(6, 1, 0); break;
             case 11: T2_SMQ_CASE(6, 1, 1); break;
             case 12: T2_SMQ_CASE(6, 1, 2); break;
+            case 13: T2_SMQ_CASE(6, 1, 3); break;
             default: return 1003;
         }
     }
     return (int)cudaGetLastError();
 }
 
-#define T2_NQ_LAUNCH(NB_, RED_, DIV_, MODE_)                                                                      \
-    gk_norm_quant_fp8_kernel<NB_, RED_, DIV_, MODE_, true><<<blocks, 128, 0, stream>>>(                           \
+#define T2_NQ_LAUNCH(NB_, RED_, DIV_, MODE_, QNT_)                                                                \
+    gk_norm_quant_fp8_kernel<NB_, RED_, DIV_, MODE_, true, QNT_><<<blocks, 128, 0, stream>>>(                     \
         (const __nv_bfloat16*)x_bf16, x_stride, (__nv_bfloat16*)r_bf16, r_stride, (const __nv_bfloat16*)w0_bf16, eps0, \
         (const __nv_bfloat16*)w_bf16, eps, (__nv_bfloat16*)y_bf16, y_stride, (uint8_t*)q_e4m3, (float*)scale_f32, M)
 
-#define T2_NQ_MODES(NB_, RED_, DIV_)                         \
-    switch (mode) {                                          \
-        case 0: T2_NQ_LAUNCH(NB_, RED_, DIV_, 0); break;     \
-        case 1: T2_NQ_LAUNCH(NB_, RED_, DIV_, 1); break;     \
-        case 2: T2_NQ_LAUNCH(NB_, RED_, DIV_, 2); break;     \
-        case 3: T2_NQ_LAUNCH(NB_, RED_, DIV_, 3); break;     \
-        default: return 1004;                                \
+#define T2_NQ_MODES(NB_, RED_, DIV_, QNT_)                         \
+    switch (mode) {                                                \
+        case 0: T2_NQ_LAUNCH(NB_, RED_, DIV_, 0, QNT_); break;     \
+        case 1: T2_NQ_LAUNCH(NB_, RED_, DIV_, 1, QNT_); break;     \
+        case 2: T2_NQ_LAUNCH(NB_, RED_, DIV_, 2, QNT_); break;     \
+        case 3: T2_NQ_LAUNCH(NB_, RED_, DIV_, 3, QNT_); break;     \
+        default: return 1004;                                      \
     }
 
-#define T2_NQ_RED(NB_, DIV_)                                 \
-    switch (red) {                                           \
-        case 0: T2_NQ_MODES(NB_, 0, DIV_); break;            \
-        case 1: T2_NQ_MODES(NB_, 1, DIV_); break;            \
-        case 2: T2_NQ_MODES(NB_, 2, DIV_); break;            \
-        case 3: T2_NQ_MODES(NB_, 3, DIV_); break;            \
-        default: return 1005;                                \
+#define T2_NQ_RED(NB_, DIV_, QNT_)                                 \
+    switch (red) {                                                 \
+        case 0: T2_NQ_MODES(NB_, 0, DIV_, QNT_); break;            \
+        case 1: T2_NQ_MODES(NB_, 1, DIV_, QNT_); break;            \
+        case 2: T2_NQ_MODES(NB_, 2, DIV_, QNT_); break;            \
+        case 3: T2_NQ_MODES(NB_, 3, DIV_, QNT_); break;            \
+        default: return 1005;                                      \
     }
 
 // v6: (residual add +) RMSNorm -> per-token FP8 (gk_norm_quant_fp8_kernel). H must be 1024 or 1536.
+// div bit 0: division mode (0=rn, 1=fast); div bit 1: QNT=3 (a_max=28.0f for f16-accum FP8 GEMM).
 int track2_norm_quant_fp8(
     const void* x_bf16, int64_t x_stride, void* r_bf16, int64_t r_stride, const void* w0_bf16, float eps0,
     const void* w_bf16, float eps, void* y_bf16, int64_t y_stride, void* q_e4m3, void* scale_f32, int M, int H,
@@ -886,10 +896,20 @@ int track2_norm_quant_fp8(
     if (M <= 0) return 0;
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     const int blocks = (M + 3) / 4;
+    const int div_mode = div & 1;
+    const int qnt_f16 = (div & 2) != 0;
     if (H == 1536) {
-        if (div == 0) { T2_NQ_RED(6, 0); } else { T2_NQ_RED(6, 1); }
+        if (qnt_f16) {
+            if (div_mode == 0) { T2_NQ_RED(6, 0, 3); } else { T2_NQ_RED(6, 1, 3); }
+        } else {
+            if (div_mode == 0) { T2_NQ_RED(6, 0, 0); } else { T2_NQ_RED(6, 1, 0); }
+        }
     } else if (H == 1024) {
-        if (div == 0) { T2_NQ_RED(4, 0); } else { T2_NQ_RED(4, 1); }
+        if (qnt_f16) {
+            if (div_mode == 0) { T2_NQ_RED(4, 0, 3); } else { T2_NQ_RED(4, 1, 3); }
+        } else {
+            if (div_mode == 0) { T2_NQ_RED(4, 0, 0); } else { T2_NQ_RED(4, 1, 0); }
+        }
     } else {
         return 1006;
     }
@@ -909,10 +929,12 @@ int track2_quant_fp8_rows(
     if (mv <= 4) {
         if (qnt_mode == 0) gk_quant_fp8_rows_kernel<4, 0><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
         else if (qnt_mode == 1) gk_quant_fp8_rows_kernel<4, 1><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else if (qnt_mode == 3) gk_quant_fp8_rows_kernel<4, 3><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
         else gk_quant_fp8_rows_kernel<4, 2><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
     } else {
         if (qnt_mode == 0) gk_quant_fp8_rows_kernel<6, 0><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
         else if (qnt_mode == 1) gk_quant_fp8_rows_kernel<6, 1><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else if (qnt_mode == 3) gk_quant_fp8_rows_kernel<6, 3><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
         else gk_quant_fp8_rows_kernel<6, 2><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
     }
     return (int)cudaGetLastError();
