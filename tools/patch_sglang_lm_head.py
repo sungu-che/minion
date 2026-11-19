@@ -213,6 +213,16 @@ def patch_worker(src: str) -> str:
     if target_am not in src:
         raise RuntimeError("Could not find draft logits.argmax(-1) block in selfspec_diffusion_worker.py")
     src = src.replace(target_am, repl_am, 1)
+
+    # 3) [TRACK2-PREFILL-COALESCE] a prefill the scheduler is deferring will not release the stash: keep drafting ahead
+    target_gate = """        if s.chunked_req is not None or (len(s.waiting_queue) and not s.running_batch.batch_is_full) or \\
+                s.grammar_manager.has_waiting_grammars():"""
+    repl_gate = """        _t2_defer = getattr(s, "_t2_prefill_deferred", None)
+        if s.chunked_req is not None or (len(s.waiting_queue) and not s.running_batch.batch_is_full
+                                         and not (_t2_defer is not None and _t2_defer(len(batch.reqs)))) or \\
+                s.grammar_manager.has_waiting_grammars():"""
+    if target_gate in src:
+        src = src.replace(target_gate, repl_gate, 1)
     return src
 
 
