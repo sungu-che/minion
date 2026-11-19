@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+rust_kernels/target/
+rust_gpu/target/
+gravity_ocr/_native/*.dll
+gravity_ocr/_native/*.so
+gravity_ocr/_native/*.dylib
+gravity_ocr/_native/*.pdb
+build/
+eval_out/
+*.zip

@@ -1,0 +1,7 @@
+# Track 2 (Gravity-OCR Speed Run) submission entrypoint.
+# 4-stage tuning presets (switch via env without rebuilding):
+#   Stage 0 (baseline):   serve: env TRACK2_STAGE=0 CONCURRENCY=48 python3 serve.py
+#   Stage 1 (I/O+bucket): serve: env TRACK2_STAGE=1 TRACK2_CONCURRENCY=96 python3 serve.py
+#   Stage 2 (+vocab):     serve: env TRACK2_STAGE=2 TRACK2_RESCUE=1 TRACK2_CONCURRENCY=96 python3 serve.py
+#   Stage 3 (+1hop RoPE): serve: env TRACK2_STAGE=3 TRACK2_RESCUE=1 TRACK2_CONCURRENCY=96 python3 serve.py
+serve: python3 serve.py

@@ -1,0 +1,6 @@
+{
+  "test_runs": 3,
+  "restart_between_runs": true,
+  "ready_timeout_seconds": 300,
+  "run_timeout_seconds": 300
+}

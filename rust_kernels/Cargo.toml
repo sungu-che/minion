@@ -1,0 +1,23 @@
+[package]
+name = "gravity_kernels"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native kernels of the gravity-ocr Python runtime (called through ctypes)"
+publish = false
+
+[lib]
+name = "gravity_kernels"
+crate-type = ["cdylib", "rlib"]
+
+# Apache-2.0 / MIT crates only.
+[dependencies]
+rayon = "1"
+half = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

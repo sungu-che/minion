@@ -1,0 +1,3 @@
+{"id": "ko-formula-0268", "image": "images/ko-formula-0268.png", "task": "formula", "prompt": "Formula Recognition:"}
+{"id": "ko-table-0251", "image": "images/ko-table-0251.png", "task": "table", "prompt": "Table Recognition:"}
+{"id": "ko-text-0000", "image": "images/ko-text-0000.png", "task": "text", "prompt": "Text Recognition:"}

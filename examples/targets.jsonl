@@ -1,0 +1,3 @@
+{"id": "ko-formula-0268", "task": "formula", "source": "blog", "target": "(B \\cdot S, V)"}
+{"id": "ko-table-0251", "task": "table", "source": "blog", "target": "<table><tr><td>Data Store</td><td>문서의 정보량</td><td>문서 간 관계</td><td>규모</td><td>Long-tail</td></tr><tr><td>웹</td><td>X</td><td>△</td><td>O</td><td>O</td></tr><tr><td>사내 문서</td><td>O</td><td>O</td><td>X</td><td>O</td></tr><tr><td>Wikipedia</td><td>O</td><td>O</td><td>O</td><td>X</td></tr><tr><td>논문</td><td>O</td><td>O</td><td>O</td><td>O</td></tr></table>"}
+{"id": "ko-text-0000", "task": "text", "source": "blog", "target": "AR과의 차이는 둘입니다. 채우는 순서, 그리고 한 번에 채우는 개수. AR은 왼쪽에서 오른쪽으로, 그것도 한 칸씩만 채울 수 있어 토큰 $N$개에 forward도 $N$번이 필요합니다. 반면 diffusion은 순서에 매이지 않고 아무 칸이나, 게다가 여러 칸을 한 스텝에 동시에 채울 수 있어 훨씬 적은 forward로 끝낼 수 있습니다."}

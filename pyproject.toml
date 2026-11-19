@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gravity-ocr"
+version = "0.2.0"
+description = "GravityOCR-KO: drawing OCR runtime (Python orchestration, Rust CPU kernels, ROCm / Vulkan / CUDA engine on candle-rocm-vulkan)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# runtime dependencies: all BSD / MIT / Apache-2.0 / HPND
+dependencies = [
+    "numpy>=1.26",     # BSD-3-Clause
+    "pillow>=10",      # MIT-CMU (HPND)
+    "scipy>=1.11",     # BSD-3-Clause (numpy fallback of the pixel kernels)
+    "tokenizers>=0.19" # Apache-2.0
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# the reference oracle and baseline ① only (never imported by the runtime)
+reference = ["torch>=2.4", "transformers>=5.0"]
+
+[tool.setuptools.packages.find]
+include = ["gravity_ocr*"]
+
+[tool.setuptools.package-data]
+gravity_ocr = ["_native/*.dll", "_native/*.so", "_native/*.dylib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

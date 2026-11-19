@@ -1,0 +1,52 @@
+# track2-base: the pinned toolchain for Track 2 (Gravity-OCR Speed Run).
+# Teams build on this image and must not replace anything under `pinned:`; the harness checks these at run time.
+
+image:
+  name: track2-base
+  tag: v1                                            # bump on any change below
+  from: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04   # devel: nvcc + headers so teams can build kernels
+  from_digest: sha256:ad6d59a3bbf3e82c1c849c9ac09cfc2a3e0bbb8655042fd899be6681b3fe2a85
+
+gravityocr_serving:                                  # where the serving stack comes from
+  repo: trillion-labs/trida-stack                    # inference/gravityocr/
+  commit: 79ed00c72c99ad71edd301302a75bc15ada8e927   # release v0.2.0 (main on 2026-11-16, PR #72 merged); fetched by SHA
+  recipe: inference/gravityocr/sglang/setup.sh       # fetch SGLang pin -> apply patch -> venv from the lock
+  sglang_upstream: sgl-project/sglang@1519acf37c23f2189adb93f57ca9cd2db1bebf18   # tag v0.5.10
+  patch: inference/gravityocr/sglang/gravityocr_selfspec.patch   # trida-stack v0.2.0 copy (moved on from GravityOCR@4ab5d54)
+  lock: inference/gravityocr/sglang/requirements-lock.txt        # 179 pins at v0.2.0, Python 3.12 (all packages)
+  uv: 0.11.27                                        # version the lock was generated and tested with
+
+host:
+  gpu: NVIDIA L40S (sm_89, 48 GB)
+  validated_by_trida_stack: H100 80 GB, driver 570, CUDA 12.8   # PR #72 GPU verification
+  driver: 570.211.01                                 # what GravityOCR's release and trida-stack were validated on
+  driver_min: "570"                                  # CUDA 12.8
+  # Brev's L40S image ships driver 565.57.01 (max CUDA 12.7), held by apt, and its CDI generator crashes with it.
+  # Upgrade with deploy/gpu-driver/upgrade-to-570.sh (plan, apply, reboot, verify.sh).
+
+pinned:                                              # checked by the harness; changing these is not allowed
+  python: "3.12"
+  cuda_toolkit: "12.8"
+  torch: 2.9.1
+  torchvision: 0.24.1+cu128                          # as in trida-stack's lock at v0.2.0 (and the built image)
+  triton: 3.5.1
+  flashinfer-python: 0.6.7.post2
+  sglang-kernel: 0.4.1
+  sglang: 0.5.10                                     # + gravityocr_selfspec.patch (installed editable)
+  transformers: 5.3.0
+
+model:
+  repo: trillionlabs/GravityOCR-KO                   # public, not gated on Hugging Face, ~2.2 GB
+  revision: 6c749d417879037da8a1f6af4cf9aaa7632308bc # HF commit, 2026-11-17; frozen for the event
+  safetensors_sha256: c0dbf76d117f                   # LFS oid prefix of model.safetensors (was 1620ae83ba65)
+  path_in_image: /opt/gravityocr/weights             # PENDING: may move to Codabench task data
+
+scorer:                                              # GravityOCR's own evaluation code, as trida-stack builds it
+  recipe: benchmark/gravityocr/setup.sh              # trida-stack at the commit above, SKIP_SGLANG=1
+  metrics: benchmark/gravityocr/score.py             # text 1-Edit_dist, table TEDS, formula CDM (OmniDocBench)
+  omnidocbench: opendatalab/OmniDocBench@0604d9843f1dfa3a292bd5f253ae83a1ba47cd24   # pinned by setup.sh
+  python: "3.10"                                     # its own venv: /opt/gravityocr-eval/venv
+  texlive: upstream install-tl, scheme-basic + CDM packages   # NOT pinned: the year's TeX Live at build time
+  path_in_image: /opt/gravityocr-eval
+
+serving_defaults: see trida-stack inference/gravityocr/serve.sh (MODE=self-spec, FAST=1)

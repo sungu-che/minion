@@ -1,0 +1,35 @@
+[package]
+name = "gravity_gpu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GPU engine of the gravity-ocr Python runtime on candle-rocm-vulkan (ROCm / Vulkan / CUDA)"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "gravity_gpu"
+crate-type = ["cdylib"]
+
+# Apache-2.0 / MIT crates only.  candle-core / candle-nn are the ROCm / Vulkan
+# fork (Apache-2.0), pinned to one commit.
+[dependencies]
+# flash-attn: fused attention kernels; turbo-quant: TurboQuant / FP8 codecs and the attention on
+# packed KV rows (both JIT-compiled per GPU through NVRTC / hipRTC / Vulkan shaders)
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", default-features = false, features = ["flash-attn", "turbo-quant"] }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", default-features = false, features = ["flash-attn", "turbo-quant"] }
+hip-runtime = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", optional = true }
+gravity_kernels = { path = "../rust_kernels" }
+half = "2"
+
+[features]
+default = []
+rocm = ["candle-core/rocm", "candle-nn/rocm", "dep:hip-runtime"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = false
