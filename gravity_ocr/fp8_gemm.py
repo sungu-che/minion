@@ -162,10 +162,11 @@ def self_check(orig) -> str:
     cases = [(300, 1536, 2048), (300, 1536, 4608), (500, 1536, 2048), (500, 1536, 4608), (1452, 1536, 4608),
              (1419, 1536, 2048)]
     for M, N, K in cases:
-        a = (torch.randn(M, K, device="cuda") * 0.6).to(torch.float8_e4m3fn)
-        b = (torch.randn(N, K, device="cuda") * 0.6).to(torch.float8_e4m3fn).t()
-        sa = torch.rand(M, 1, device="cuda") * 0.02 + 1e-3
-        sb = torch.rand(N, 1, device="cuda") * 0.02 + 1e-3
+        f32 = torch.float32  # explicit: SGLang sets the default dtype to bf16 while it loads the model
+        a = (torch.randn(M, K, device="cuda", dtype=f32) * 0.6).to(torch.float8_e4m3fn)
+        b = (torch.randn(N, K, device="cuda", dtype=f32) * 0.6).to(torch.float8_e4m3fn).t()
+        sa = torch.rand(M, 1, device="cuda", dtype=f32) * 0.02 + 1e-3
+        sb = torch.rand(N, 1, device="cuda", dtype=f32) * 0.02 + 1e-3
         sel = _eligible(a, b, sa, sb, torch.bfloat16, None)
         if sel is None:
             return f"case {M}x{N}x{K} not eligible"

@@ -589,7 +589,7 @@ def _t2_get_cuda_sm89():
             try:
                 # v6 fused FP8 kernels (MLP silu*up+quant, fast M-RoPE); before any CUDA graph capture
                 from gravity_ocr import fused_fp8 as _t2_ff
-                _t2_ff.install()
+                _t2_ff.install(self)  # self: the GlmOcr model (layer / block stacks get chained)
             except Exception as _e:
                 print(f"[track2-fused] OFF: {_e}", flush=True)"""
     if target_lw not in src:

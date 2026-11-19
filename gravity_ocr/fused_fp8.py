@@ -1,20 +1,27 @@
-"""v6 fused kernels wired into SGLang's GLM-OCR forward (installed from models/glm_ocr.py load_weights, i.e. before any
-CUDA graph is captured).
+"""v6-v8 fused kernels wired into SGLang's GLM-OCR forward (installed from models/glm_ocr.py load_weights, i.e. before
+any CUDA graph is captured). Every replacement reproduces the replaced arithmetic bit for bit (kernel tests:
+tools/test_fused_kernels.py, tools/test_fp8_gemm.py; in-server check: TRACK2_FUSED_VERIFY=1, below).
 
-  MLP   (Glm4MLP: language model, Glm4vVisionMLP: ViT)
-        gate_up -> [silu_and_mul -> sglang_per_token_quant_fp8] -> fp8_scaled_mm(down_proj)
-        becomes gate_up -> [cuda_sm89.silu_mul_quant_fp8] -> the same fp8_scaled_mm call apply_fp8_linear makes.
-        The fused kernel's (q, scale) are bitwise equal to the two kernels it replaces (tools/test_fused_kernels.py smq),
-        so the down_proj output is unchanged.
-  MROPE (MRotaryEmbedding.forward_triton) -> gravity_ocr.fast_mrope (bitwise equal, tools/test_fused_kernels.py mrope).
+  GEMM  fp8_utils.fp8_scaled_mm -> gravity_ocr.fp8_gemm dispatcher (bit-exact Triton on o/down at decode batch 8-15,
+        43-44; CUTLASS elsewhere)
+  MLP   (Glm4MLP: language model, Glm4vVisionMLP: ViT): silu_and_mul + per-token quant -> cuda_sm89.silu_mul_quant_fp8
+  MROPE (MRotaryEmbedding.forward_triton) -> gravity_ocr.fast_mrope
+  NORM  (Glm4DecoderLayer, GlmOcrVisionBlock): (residual add +) RMSNorm + per-token quant -> cuda_sm89.norm_quant_fp8,
+        chained across layers (v8):
+          LM : layer i returns its down_proj output un-normalized; layer i+1 applies layer i's post_mlp_layernorm, the
+               residual add and its input_layernorm + FP8 quant in ONE kernel (mode 2). The last layer normalizes itself.
+          ViT: block i returns x_after_add and leaves `+ mlp_out` pending; block i+1 does that bf16 add, norm1 and the FP8
+               quant in ONE kernel (mode 3). The last block does the add itself.
+        A layer that falls back to SGLang's forward first finishes a pending step exactly as SGLang would.
   K2    in-place ViT q/k norm + RoPE: lives in the vision.py patch (tools/patch_sglang_vit_l40s.py, TRACK2_K2_INPLACE).
 
-Switches (default on): TRACK2_FUSED=0 turns all of them off; TRACK2_FUSED_MLP / TRACK2_FUSED_MROPE individually.
-A layer that does not match the exact FP8 path the fused code reproduces (per-channel weight scale, dynamic per-token
-activations, CUTLASS fp8_scaled_mm, tp 1) keeps SGLang's own forward.
+Switches (default on): TRACK2_FUSED=0 turns all of them off; TRACK2_FUSED_MLP / _MROPE / _NORM / _NORM_VIT / _CHAIN.
+TRACK2_FUSED_VERIFY=1 (diagnostic): the first TRACK2_FUSED_VERIFY_N (6) eager LM forwards and ViT forwards are re-run
+with SGLang's original code (all patches swapped out) and compared bitwise; results go to stdout as [track2-fused-verify].
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -23,11 +30,42 @@ _ON = os.environ.get("TRACK2_FUSED", "1") == "1"
 _MLP = _ON and os.environ.get("TRACK2_FUSED_MLP", "1") == "1"
 _MROPE = _ON and os.environ.get("TRACK2_FUSED_MROPE", "1") == "1"
 _NORM = _ON and os.environ.get("TRACK2_FUSED_NORM", "1") == "1"
+_CHAIN = os.environ.get("TRACK2_FUSED_CHAIN", "1") == "1"
+_VERIFY = os.environ.get("TRACK2_FUSED_VERIFY", "0") == "1"
+_VERIFY_N = int(os.environ.get("TRACK2_FUSED_VERIFY_N", "6"))
 _INSTALLED = False
+_PATCHES = []          # (owner, attribute, original, replacement): swapped back by _originals() (verify mode)
+
+
+def _patch(owner, name, new) -> None:
+    orig = getattr(owner, name)
+    new._t2_fused = True
+    new._t2_orig = orig
+    _PATCHES.append((owner, name, orig, new))
+    setattr(owner, name, new)
+
+
+@contextlib.contextmanager
+def _originals():
+    """SGLang's original functions in place of every patch (and CUTLASS for fp8_scaled_mm) for the duration."""
+    for owner, name, orig, _new in _PATCHES:
+        setattr(owner, name, orig)
+    try:
+        yield
+    finally:
+        for owner, name, _orig, new in _PATCHES:
+            setattr(owner, name, new)
+
+
+class _Chain:
+    """Per layer stack: the step layer i left for layer i + 1 (LM: the post_mlp_layernorm module; ViT: mlp_out)."""
+
+    def __init__(self) -> None:
+        self.pending = None
 
 
 def _down_ok(layer) -> bool:
-    """True when `layer` (a RowParallelLinear) would run apply_fp8_linear's CUTLASS per-token path."""
+    """True when `layer` would run apply_fp8_linear's CUTLASS per-token path."""
     ok = getattr(layer, "_t2_fused_ok", None)
     if ok is not None:
         return ok
@@ -81,15 +119,13 @@ def _install_mlp(C) -> int:
             out = scaled_mm(q, dp.weight, s, dp.weight_scale, out_dtype=gate_up.dtype, bias=dp.bias)
             return out.view(*gate_up.shape[:-1], out.shape[-1])
 
-        forward._t2_fused = True
-        forward._t2_orig = orig
         return forward
 
     from sglang.srt.models import glm4, glm4v
 
     for cls in (glm4.Glm4MLP, glm4v.Glm4vVisionMLP):
         if not getattr(cls.forward, "_t2_fused", False):
-            cls.forward = make(cls.forward)
+            _patch(cls, "forward", make(cls.forward))
             n += 1
     return n
 
@@ -112,20 +148,13 @@ def _install_mrope() -> bool:
             return query, key
         return orig(self, positions, query, key)
 
-    forward_triton._t2_fused = True
-    cls.forward_triton = forward_triton
+    _patch(cls, "forward_triton", forward_triton)
     return True
 
 
 def _install_norm(C) -> int:
     """(residual add +) RMSNorm -> FP8 quant fused into the layer forwards (kernel == flashinfer norm + sgl-kernel quant,
-    bitwise), feeding the same fp8_scaled_mm calls apply_fp8_linear would make:
-
-      LM  (Glm4DecoderLayer): input_layernorm(+add) -> qkv_proj ; post_self_attn_layernorm -> add -> post_attention_layernorm
-          -> gate_up_proj ; silu*up -> down_proj (fused as in the MLP patch); post_mlp_layernorm stays SGLang's.
-      ViT (GlmOcrVisionBlock): norm1 -> qkv_proj (handed to the patched VisionAttention as _t2_pre_qkv); add + norm2 ->
-          gate_up_proj ; silu*up -> down_proj; the final residual add stays a torch add.
-    A layer whose linears are not on that exact FP8 path (or an unexpected shape) runs SGLang's forward."""
+    bitwise), feeding the same fp8_scaled_mm calls apply_fp8_linear would make; chained across layers (module doc)."""
     from sglang.srt.layers.quantization import fp8_utils as fu
     from sglang.srt.models import glm4, glm_ocr
 
@@ -140,22 +169,34 @@ def _install_norm(C) -> int:
         orig_l = L.forward
 
         def layer_forward(self, positions, hidden_states, forward_batch, residual):
+            st = getattr(self, "_t2_chain", None)
+            pend = None
+            if st is not None:
+                pend, st.pending = st.pending, None
+                if residual is None:  # first layer of a forward: nothing can be pending (drop a stale step)
+                    pend = None
             at, mlp = self.self_attn, self.mlp
             if (hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2
                     or hidden_states.shape[-1] not in (1024, 1536) or not hidden_states.is_contiguous()
                     or (residual is not None and not residual.is_contiguous())
                     or not (_down_ok(at.qkv_proj) and _down_ok(mlp.gate_up_proj) and _down_ok(mlp.down_proj))):
+                if pend is not None:
+                    hidden_states = pend(hidden_states)  # the previous layer's post_mlp_layernorm, as SGLang runs it
                 return orig_l(self, positions, hidden_states, forward_batch, residual)
             dt = hidden_states.dtype
+            ln = self.input_layernorm
             if residual is None:
                 residual = hidden_states
-                q8, s = C.norm_quant_fp8(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon,
-                                         mode=C.NORM_MODE_PLAIN)
+                q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, mode=C.NORM_MODE_PLAIN)
+            elif pend is not None:
+                # == previous layer's post_mlp_layernorm(down), then fused_add_rmsnorm(., residual) of this layer
+                q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, residual=residual,
+                                         mode=C.NORM_MODE_PRE_ADD, weight0=pend.weight, eps0=pend.variance_epsilon)
             else:
                 # == fused_add_rmsnorm(hidden_states, residual): residual += hidden_states (in place); the normalized rows
                 # go straight to FP8 (SGLang also overwrote hidden_states with them; nothing reads that buffer again)
-                q8, s = C.norm_quant_fp8(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon,
-                                         residual=residual, mode=C.NORM_MODE_ADD)
+                q8, s = C.norm_quant_fp8(hidden_states, ln.weight, ln.variance_epsilon, residual=residual,
+                                         mode=C.NORM_MODE_ADD)
             qkv = lin(at.qkv_proj, q8, s, dt)
             q, k, v = qkv.split([at.q_size, at.kv_size, at.kv_size], dim=-1)
             q, k = at.rotary_emb(positions, q, k)
@@ -167,10 +208,12 @@ def _install_norm(C) -> int:
             gate_up = lin(mlp.gate_up_proj, q8, s, dt)
             q8, s = C.silu_mul_quant_fp8(gate_up)
             down = lin(mlp.down_proj, q8, s, dt)
+            if st is not None and _CHAIN and not getattr(self, "_t2_last", True):
+                st.pending = self.post_mlp_layernorm  # applied inside the next layer's input kernel
+                return down, residual
             return self.post_mlp_layernorm(down), residual
 
-        layer_forward._t2_fused = True
-        L.forward = layer_forward
+        _patch(L, "forward", layer_forward)
         n += 1
 
     B = glm_ocr.GlmOcrVisionBlock
@@ -178,17 +221,34 @@ def _install_norm(C) -> int:
         orig_b = B.forward
 
         def block_forward(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin):
+            st = getattr(self, "_t2_chain", None)
+            pend = None
+            if st is not None:
+                pend, st.pending = st.pending, None
+                if getattr(self, "_t2_first", False):  # first block of a forward: drop a stale step
+                    pend = None
             at, mlp = self.attn, self.mlp
             if (x.dim() != 3 or x.shape[1] != 1 or x.shape[0] == 0 or x.dtype != torch.bfloat16
                     or x.shape[-1] not in (1024, 1536) or not x.is_contiguous()
+                    or (pend is not None and (pend.shape != x.shape or not pend.is_contiguous()))
                     or not getattr(at, "_track2_k2_inplace", False)
                     or not (_down_ok(at.qkv_proj) and _down_ok(mlp.gate_up_proj) and _down_ok(mlp.down_proj))):
+                if pend is not None:
+                    x = x + pend  # the previous block's `x_after_add + mlp_out`, as SGLang runs it
                 return orig_b(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
             S, _, H = x.shape
             x2d = x.view(S, H)
-            q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, mode=C.NORM_MODE_PLAIN)
+            if pend is not None:
+                # == the previous block's `x = x_after_add + mlp_out` (bf16 torch add), then norm1(x) + FP8 quant;
+                # the sum is written into pend's buffer, which is this block's input from here on
+                p2d = pend.view(S, H)
+                q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, residual=p2d,
+                                         mode=C.NORM_MODE_ROUND_ADD)
+                x2d = p2d
+            else:
+                q8, s = C.norm_quant_fp8(x2d, self.norm1.weight, self.norm1.variance_epsilon, mode=C.NORM_MODE_PLAIN)
             at._t2_pre_qkv = lin(at.qkv_proj, q8, s, x.dtype).view(1, S, -1)   # consumed by the patched attention forward
-            attn = at(x.view(1, S, H), cu_seqlens=cu_seqlens, rotary_pos_emb_cos=rotary_pos_emb_cos,
+            attn = at(x2d.view(1, S, H), cu_seqlens=cu_seqlens, rotary_pos_emb_cos=rotary_pos_emb_cos,
                       rotary_pos_emb_sin=rotary_pos_emb_sin)
             at.__dict__.pop("_t2_pre_qkv", None)
             attn2d = attn.reshape(S, H)
@@ -200,15 +260,88 @@ def _install_norm(C) -> int:
             gate_up = lin(mlp.gate_up_proj, q8, s, x.dtype)
             q8, s = C.silu_mul_quant_fp8(gate_up)
             mlp_out = lin(mlp.down_proj, q8, s, x.dtype)
+            if st is not None and _CHAIN and not getattr(self, "_t2_last", True):
+                st.pending = mlp_out.view(S, 1, H)  # added inside the next block's norm1 kernel
+                return attn2d.view(S, 1, H)
             return (attn2d + mlp_out).view(S, 1, H)
 
-        block_forward._t2_fused = True
-        B.forward = block_forward
+        _patch(B, "forward", block_forward)
         n += 1
     return n
 
 
-def install() -> None:
+def _mark_chains(model) -> str:
+    """Give every LM decoder-layer stack / ViT block stack of `model` a shared _Chain and first / last flags."""
+    if model is None or not _CHAIN:
+        return "unchained"
+    from sglang.srt.models import glm4, glm_ocr
+
+    out = []
+    for m in model.modules():
+        if isinstance(m, glm4.Glm4Model) and not getattr(m, "layers_to_capture", None):
+            layers = [x for x in m.layers if isinstance(x, glm4.Glm4DecoderLayer)]
+            if len(layers) == len(m.layers) and layers:
+                st = _Chain()
+                for i, layer in enumerate(layers):
+                    layer._t2_chain, layer._t2_last = st, i == len(layers) - 1
+                out.append(f"LM {len(layers)} layers")
+        if isinstance(m, glm_ocr.GlmOcrVisionModel):
+            blocks = [b for b in m.blocks if isinstance(b, glm_ocr.GlmOcrVisionBlock)]
+            if len(blocks) == len(m.blocks) and blocks:
+                st = _Chain()
+                for i, b in enumerate(blocks):
+                    b._t2_chain, b._t2_first, b._t2_last = st, i == 0, i == len(blocks) - 1
+                out.append(f"ViT {len(blocks)} blocks")
+    return "chained " + " + ".join(out) if out else "unchained"
+
+
+def _install_verify() -> str:
+    """TRACK2_FUSED_VERIFY=1: compare eager forwards with SGLang's original code, bitwise (diagnostic)."""
+    from sglang.srt.models import glm4, glm_ocr
+
+    def report(tag, k, a, b, extra):
+        a = a[0] if isinstance(a, (tuple, list)) else a
+        b = b[0] if isinstance(b, (tuple, list)) else b
+        same = bool(torch.equal(a, b))
+        d = 0.0 if same else float((a.float() - b.float()).abs().max())
+        print(f"[track2-fused-verify] {tag} eager forward #{k} {extra}: bitwise={same}"
+              + ("" if same else f" max|diff|={d:.4g} differing={int((a != b).sum())}/{a.numel()}"), flush=True)
+
+    cnt = {"lm": 0, "vit": 0}
+    M = glm4.Glm4Model
+    orig_m = M.forward
+
+    def model_forward(self, input_ids, positions, forward_batch, input_embeds=None, pp_proxy_tensors=None, **kw):
+        if cnt["lm"] >= _VERIFY_N or torch.cuda.is_current_stream_capturing():
+            return orig_m(self, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors, **kw)
+        cnt["lm"] += 1
+        emb = input_embeds.clone() if input_embeds is not None else None  # layer 0 updates its residual in place
+        out = orig_m(self, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors, **kw)
+        with _originals():
+            ref = orig_m(self, input_ids, positions, forward_batch, emb, pp_proxy_tensors, **kw)
+        report("LM", cnt["lm"], out, ref, f"tokens={int(positions.shape[-1])} mode={forward_batch.forward_mode.name}")
+        return out
+
+    V = glm_ocr.GlmOcrVisionModel
+    orig_v = V.forward
+
+    def vision_forward(self, x, grid_thw):
+        if cnt["vit"] >= _VERIFY_N or torch.cuda.is_current_stream_capturing():
+            return orig_v(self, x, grid_thw)
+        cnt["vit"] += 1
+        x_ref = x.clone()
+        out = orig_v(self, x, grid_thw)
+        with _originals():
+            ref = orig_v(self, x_ref, grid_thw)
+        report("ViT", cnt["vit"], out, ref, f"images={int(grid_thw.shape[0])} patches={int(x.shape[0])}")
+        return out
+
+    M.forward = model_forward  # not in _PATCHES: the wrappers stay while _originals() runs the reference
+    V.forward = vision_forward
+    return f"VERIFY first {_VERIFY_N} eager LM / ViT forwards"
+
+
+def install(model=None) -> None:
     global _INSTALLED
     if _INSTALLED or not _ON:
         if not _ON:
@@ -219,9 +352,14 @@ def install() -> None:
 
     parts = []
     try:  # must precede _install_mlp / _install_norm: they capture fp8_utils.fp8_scaled_mm
+        from sglang.srt.layers.quantization import fp8_utils as fu
+
         from gravity_ocr import fp8_gemm
 
+        orig_mm = fu.fp8_scaled_mm
         parts.append(fp8_gemm.install())
+        if fu.fp8_scaled_mm is not orig_mm:  # registered so verify mode can swap CUTLASS back in
+            _PATCHES.append((fu, "fp8_scaled_mm", orig_mm, fu.fp8_scaled_mm))
     except Exception as e:
         parts.append(f"Triton FP8 GEMM unavailable ({e})")
     if _MLP:
@@ -238,9 +376,14 @@ def install() -> None:
     if _NORM and _MLP:
         if C.norm_available():
             try:
-                parts.append(f"norm+fp8-quant layers ({_install_norm(C)} classes)")
+                parts.append(f"norm+fp8-quant layers ({_install_norm(C)} classes, {_mark_chains(model)})")
             except Exception as e:
                 parts.append(f"norm fusion unavailable ({e})")
         else:
             parts.append("norm fusion unavailable (libtrack2_cuda_sm89.so without track2_norm_quant_fp8)")
+    if _VERIFY:
+        try:
+            parts.append(_install_verify())
+        except Exception as e:
+            parts.append(f"verify unavailable ({e})")
     print(f"[track2-fused] ON: {', '.join(parts) or 'nothing'}", flush=True)

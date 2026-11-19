@@ -127,7 +127,10 @@ def load() -> Optional[ctypes.CDLL]:
     except Exception:
         _LIB = None
     if _LIB is not None:
-        _register_fused(_LIB)
+        try:
+            _register_fused(_LIB)
+        except Exception:  # load() must never raise: callers gate the whole shm / GPU image path on it
+            pass
     return _LIB
 
 
@@ -147,13 +150,14 @@ QNT_MODE = int(os.environ.get("TRACK2_FUSED_QNT_MODE", "0"))
 
 
 def _register_fused(lib: ctypes.CDLL) -> bool:
-    global _FUSED
+    """Optional kernels; never raises (a library built from an older .cu keeps serving the base kernels above)."""
+    global _FUSED, _NORM
+    vp, i32, i64, f32 = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
     try:
         lib.track2_fused_abi.argtypes = []
         lib.track2_fused_abi.restype = ctypes.c_int
         if int(lib.track2_fused_abi()) != FUSED_ABI:
             return False
-        vp, i32, i64, f32 = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
         lib.track2_vis_qk_norm_rope_inplace.argtypes = [vp, vp, vp, vp, vp, i32, f32, i32, i32, vp]
         lib.track2_vis_qk_norm_rope_inplace.restype = i32
         lib.track2_silu_mul_quant_fp8.argtypes = [vp, i64, vp, vp, i32, i32, i32, i32, vp]
@@ -161,15 +165,14 @@ def _register_fused(lib: ctypes.CDLL) -> bool:
         lib.track2_quant_fp8_rows.argtypes = [vp, i64, vp, vp, i32, i32, i32, vp]
         lib.track2_quant_fp8_rows.restype = i32
         _FUSED = True
-    except AttributeError:
+    except Exception:
         _FUSED = False
-    global _NORM
     try:  # added after ABI 1 builds shipped: optional, the kernels above keep working without it
         lib.track2_norm_quant_fp8.argtypes = [vp, i64, vp, i64, vp, f32, vp, f32, vp, i64, vp, vp, i32, i32, i32, i32, i32,
                                               vp]
         lib.track2_norm_quant_fp8.restype = i32
         _NORM = _FUSED
-    except AttributeError:
+    except Exception:
         _NORM = False
     return _FUSED
 

@@ -142,6 +142,96 @@ def patch_fast_attn(src: str) -> str:
     if old not in src:
         raise RuntimeError("Could not locate the graph wrapper construction in capture()")
     src = src.replace(old, new, 1)
+    return patch_draft_kernel(src)
+
+
+DK_MODULE = '''
+
+# [TRACK2-DRAFT-KERNEL] the one-pass draft attention through a prebuilt flashinfer module (tools/build_draft_attn.py)
+# whose kCustom mask is load-free -- row 0 (seed) causal, rows >= 1 (masks) every kv: the same pattern as the packed mask
+# above, same plan / tiles / numerics, bitwise equal output. "patch" (default): the mask runs only on the causal mask
+# tiles (~1.0x the causal kernel's time instead of ~1.9x); "arith": arithmetic mask on every tile; "" / "off": the packed
+# custom-mask kernel. Any load failure -> the packed-mask kernel (logged).
+_T2_DRAFT_KERNEL = os.environ.get("TRACK2_DRAFT_KERNEL", "patch").strip().lower()
+
+
+def _t2_draft_module():
+    if _T2_DRAFT_KERNEL in ("", "off", "0", "none"):
+        return None
+    try:
+        import tvm_ffi
+        import gravity_ocr
+
+        d = os.environ.get("TRACK2_DRAFT_KERNEL_DIR") or os.path.join(os.path.dirname(gravity_ocr.__file__), "_native")
+        so = os.path.join(d, f"fi_draft_seed{_T2_DRAFT_KERNEL}.so")
+        if not os.path.isfile(so):
+            logger.warning(f"[track2-draft-kernel] {so} missing: packed-mask draft attention")
+            return None
+        m = tvm_ffi.load_module(so)
+        logger.info(f"[track2-draft-kernel] ON: draft attention via {so}")
+        print(f"[track2-draft-kernel] ON: seed{_T2_DRAFT_KERNEL} draft attention", flush=True)
+        return m
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"[track2-draft-kernel] load failed ({e}): packed-mask draft attention")
+        return None
+
+
+class _T2DraftModule:
+    """flashinfer wrapper module stand-in: plan = the prebuilt module's PrefillPlan (the same C++ as the stock module's),
+    paged_run appends the variant's one extra argument (sm_scale, as flashinfer's run() computes it)."""
+
+    def __init__(self, mod, w, head_dim):
+        self._m, self._w, self._d = mod, w, head_dim
+        self.plan = mod.plan
+
+    def paged_run(self, *args):
+        sc = self._w._sm_scale
+        if sc is None:
+            sc = 1.0 / (self._d ** 0.5)
+        return self._m.paged_run(*args, float(sc))
+'''
+
+
+def patch_draft_kernel(src: str) -> str:
+    """Route the draft role's wrappers (eager + captured) through the load-free seed-mask module (sub-agent audit)."""
+    if "[TRACK2-DRAFT-KERNEL]" in src:
+        return src
+    anchor = "\nclass _RoleState:"
+    if anchor not in src:
+        raise RuntimeError("Could not locate _RoleState in selfspec_fast_attn.py")
+    src = src.replace(anchor, DK_MODULE + "\n" + anchor, 1)
+
+    old = "        self.graph_wrappers: Dict[Tuple[int, str], object] = {}\n"
+    new = old + "        self.t2_dk = _t2_draft_module() if self.t2_mask else None  # [TRACK2-DRAFT-KERNEL]\n"
+    if src.count(old) != 1:
+        raise RuntimeError("Could not locate graph_wrappers in SelfSpecFastPlanner.__init__")
+    src = src.replace(old, new, 1)
+
+    old = """            w = self._Wrapper(self.backend.workspace_buffer, "NHD", backend=self.backend.prefill_backend)
+            self._share_int_ws(st, w)
+"""
+    new = """            w = self._Wrapper(self.backend.workspace_buffer, "NHD", backend=self.backend.prefill_backend)
+            if role == ROLE_DRAFT and self.t2_dk is not None:  # [TRACK2-DRAFT-KERNEL]
+                w._jit_module = _T2DraftModule(self.t2_dk, w, self.head_dim)
+            self._share_int_ws(st, w)
+"""
+    if src.count(old) != 1:
+        raise RuntimeError("Could not locate the eager wrapper construction")
+    src = src.replace(old, new, 1)
+
+    old = """            mask_indptr_buf=st.t2_mask_indptr[: bs + 1] if (role == ROLE_DRAFT and self.t2_mask) else None,
+        )
+        self._share_int_ws(st, w)
+"""
+    new = """            mask_indptr_buf=st.t2_mask_indptr[: bs + 1] if (role == ROLE_DRAFT and self.t2_mask) else None,
+        )
+        if role == ROLE_DRAFT and self.t2_dk is not None:  # [TRACK2-DRAFT-KERNEL]
+            w._jit_module = _T2DraftModule(self.t2_dk, w, self.head_dim)
+        self._share_int_ws(st, w)
+"""
+    if src.count(old) != 1:
+        raise RuntimeError("Could not locate the captured wrapper's _share_int_ws")
+    src = src.replace(old, new, 1)
     return src
 
 

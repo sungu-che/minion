@@ -92,11 +92,16 @@ _SHM_NP: Optional[np.ndarray] = None
 _SHM_OFFSET = 0
 
 
+_T2_CAP_TEXT = int(os.environ.get("TRACK2_TEXT_MAX_PATCHES", "0"))    # 0 = off
+_T2_CAP_TABLE = int(os.environ.get("TRACK2_TABLE_MAX_PATCHES", "0"))  # 0 = off
+
+
 def _t2_sm89_lib_present() -> bool:
+    # the library must LOAD with its base kernels (missing or unloadable build -> CPU path, never broken descriptors)
     try:
         from gravity_ocr import cuda_sm89 as _c
 
-        return _c._find_lib() is not None
+        return _c.load() is not None
     except Exception:
         return False
 
@@ -208,6 +213,19 @@ def _fast_prepare_shm_or_bf16(
         if s < 1.0:
             sh, sw = _g_textscale.scaled_size(h, w, s)
             th, tw = _g_preprocess.smart_resize(sh, sw)
+    _cap = _T2_CAP_TEXT if task == "text" else (_T2_CAP_TABLE if task == "table" else 0)  # formulas: never capped
+    if _cap > 0 and (th // 14) * (tw // 14) > _cap:
+        # [TRACK2-PATCH-CAP] opt-in (TRACK2_TEXT_MAX_PATCHES / TRACK2_TABLE_MAX_PATCHES): an outlier crop above the cap is
+        # resampled down to it (same single bicubic resample on the GPU, aspect kept)
+        _f = ((_cap / ((th // 14) * (tw // 14))) ** 0.5) * 0.999
+        for _ in range(12):
+            nh, nw = _g_preprocess.smart_resize(max(28, int(th * _f)), max(28, int(tw * _f)))
+            if (nh // 14) * (nw // 14) <= _cap:
+                break
+            _f *= 0.97
+        if (nh // 14) * (nw // 14) <= _cap:
+            s = s * ((nh * nw) / float(th * tw)) ** 0.5
+            th, tw = nh, nw
     gh, gw = th // 14, tw // 14
 
     if use_shm_gpu:
