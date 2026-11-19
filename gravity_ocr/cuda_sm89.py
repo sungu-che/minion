@@ -126,11 +126,128 @@ def load() -> Optional[ctypes.CDLL]:
         _LIB = lib
     except Exception:
         _LIB = None
+    if _LIB is not None:
+        _register_fused(_LIB)
     return _LIB
 
 
 def available() -> bool:
     return load() is not None
+
+
+# ---------------------------------------------------------------------------------------------- v6 fused kernels
+# Registered separately: a .so built from an older .cu (no fused symbols) still serves the kernels above.
+_FUSED = False
+FUSED_ABI = 1
+# arithmetic variants of the fused SiLU / FP8-scale math (picked by tools/test_fused_kernels.py: the pair whose outputs
+# are bitwise equal to sgl_kernel.silu_and_mul + sgl_per_token_quant_fp8 on this build)
+ACT_MODE = int(os.environ.get("TRACK2_FUSED_ACT_MODE", "0"))
+QNT_MODE = int(os.environ.get("TRACK2_FUSED_QNT_MODE", "0"))
+
+
+def _register_fused(lib: ctypes.CDLL) -> bool:
+    global _FUSED
+    try:
+        lib.track2_fused_abi.argtypes = []
+        lib.track2_fused_abi.restype = ctypes.c_int
+        if int(lib.track2_fused_abi()) != FUSED_ABI:
+            return False
+        vp, i32, i64, f32 = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
+        lib.track2_vis_qk_norm_rope_inplace.argtypes = [vp, vp, vp, vp, vp, i32, f32, i32, i32, vp]
+        lib.track2_vis_qk_norm_rope_inplace.restype = i32
+        lib.track2_silu_mul_quant_fp8.argtypes = [vp, i64, vp, vp, i32, i32, i32, i32, vp]
+        lib.track2_silu_mul_quant_fp8.restype = i32
+        lib.track2_quant_fp8_rows.argtypes = [vp, i64, vp, vp, i32, i32, i32, vp]
+        lib.track2_quant_fp8_rows.restype = i32
+        _FUSED = True
+    except AttributeError:
+        _FUSED = False
+    return _FUSED
+
+
+def fused_available() -> bool:
+    return load() is not None and _FUSED
+
+
+def vis_qk_norm_rope_inplace(
+    qkv: torch.Tensor,
+    qn_weight: torch.Tensor,
+    kn_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float,
+    num_heads: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """K2 in place: Q / K head RMSNorm + NeoX 2D RoPE applied inside `qkv` ([..., 3 * H * 64], contiguous).
+
+    Returns strided [S, H, 64] views (q, k, v) of `qkv` (last dim contiguous, row stride 3 * H * 64): FA2-varlen and
+    SDPA take them as they are. Values are bitwise equal to vis_qkv_sdpa_bf16(..., out_shd=True)."""
+    lib = load()
+    assert lib is not None and _FUSED
+    assert qkv.dtype == torch.bfloat16 and qkv.is_contiguous() and qkv.data_ptr() % 16 == 0
+    s = int(qkv.numel() // (3 * num_heads * 64))
+    cos_c = cos.contiguous()
+    sin_c = sin.contiguous()
+    cos_is_bf16 = 1 if cos_c.dtype == torch.bfloat16 else 0
+    if not cos_is_bf16 and cos_c.dtype != torch.float32:
+        cos_c = cos_c.float()
+        sin_c = sin_c.float()
+    stream = torch.cuda.current_stream(qkv.device).cuda_stream
+    err = lib.track2_vis_qk_norm_rope_inplace(
+        qkv.data_ptr(), qn_weight.data_ptr(), kn_weight.data_ptr(), cos_c.data_ptr(), sin_c.data_ptr(),
+        cos_is_bf16, float(eps), s, num_heads, stream,
+    )
+    if err != 0:
+        raise RuntimeError(f"track2_vis_qk_norm_rope_inplace CUDA error {err}")
+    v3 = qkv.view(s, 3, num_heads, 64)
+    return v3[:, 0], v3[:, 1], v3[:, 2]
+
+
+def silu_mul_quant_fp8(gate_up: torch.Tensor, act_mode: Optional[int] = None,
+                       qnt_mode: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """bf16(silu(gate) * up) -> per-token FP8 (q [M, I] float8_e4m3fn, scale [M, 1] float32) in one kernel.
+
+    Same outputs as sglang_per_token_quant_fp8(silu_and_mul(gate_up)) (bitwise for the build's ACT/QNT modes)."""
+    lib = load()
+    assert lib is not None and _FUSED
+    two_i = int(gate_up.shape[-1])
+    inter = two_i // 2
+    x2 = gate_up.reshape(-1, two_i)
+    if x2.stride(-1) != 1 or x2.data_ptr() % 16 or (x2.stride(0) * 2) % 16:
+        x2 = x2.contiguous()
+    m = int(x2.shape[0])
+    q = torch.empty((m, inter), dtype=torch.float8_e4m3fn, device=gate_up.device)
+    s = torch.empty((m, 1), dtype=torch.float32, device=gate_up.device)
+    if m == 0:
+        return q, s
+    stream = torch.cuda.current_stream(gate_up.device).cuda_stream
+    err = lib.track2_silu_mul_quant_fp8(x2.data_ptr(), int(x2.stride(0)), q.data_ptr(), s.data_ptr(), m, inter,
+                                        ACT_MODE if act_mode is None else int(act_mode),
+                                        QNT_MODE if qnt_mode is None else int(qnt_mode), stream)
+    if err != 0:
+        raise RuntimeError(f"track2_silu_mul_quant_fp8 CUDA error {err}")
+    return q, s
+
+
+def quant_fp8_rows(x: torch.Tensor, qnt_mode: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token FP8 quant of bf16 rows (the arithmetic of silu_mul_quant_fp8's second half)."""
+    lib = load()
+    assert lib is not None and _FUSED
+    k = int(x.shape[-1])
+    x2 = x.reshape(-1, k)
+    if x2.stride(-1) != 1 or x2.data_ptr() % 16 or (x2.stride(0) * 2) % 16:
+        x2 = x2.contiguous()
+    m = int(x2.shape[0])
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m == 0:
+        return q, s
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    err = lib.track2_quant_fp8_rows(x2.data_ptr(), int(x2.stride(0)), q.data_ptr(), s.data_ptr(), m, k,
+                                    QNT_MODE if qnt_mode is None else int(qnt_mode), stream)
+    if err != 0:
+        raise RuntimeError(f"track2_quant_fp8_rows CUDA error {err}")
+    return q, s
 
 
 def u8_norm_bf16(x_u8: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:

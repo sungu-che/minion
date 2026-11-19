@@ -65,6 +65,7 @@ if USE_SHM_IPC:
         USE_SHM_IPC = False
 
 IPC_MODE = "shm_symlink" if USE_SHM_IPC else "png_b64"
+_JOB_NO = 0
 
 TASK_PROMPTS = {
     "table": "Table Recognition:",
@@ -80,6 +81,13 @@ try:  # reference-convention output normalization (gravity_ocr/postfix.py)
     from gravity_ocr import postfix as _postfix
 except Exception:
     _postfix = None
+
+try:  # multi-layer run log (gravity_ocr/t2log.py), client layer L1
+    from gravity_ocr import t2log as _t2log
+    if _t2log.LEVEL < 1:
+        _t2log = None
+except Exception:
+    _t2log = None
 
 
 def log(msg: str) -> None:
@@ -194,6 +202,8 @@ class AsyncKeepAlivePool:
         self.max_conns = max_conns
         self._sem = asyncio.Semaphore(max_conns)
         self._idle: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+        self.n_retry = 0   # requests re-sent on a fresh socket (stale keep-alive socket)
+        self.n_fail = 0    # requests that failed on every attempt
 
     async def _open_conn(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         reader, writer = await asyncio.open_connection(self.host, self.port, limit=4 * 1024 * 1024)
@@ -260,7 +270,7 @@ class AsyncKeepAlivePool:
             keep_alive = False
         return status, body, keep_alive
 
-    async def post_chat(self, image_url: str, prompt: str) -> str:
+    async def post_chat(self, image_url: str, prompt: str, rid: str | None = None) -> str:
         if API == "generate":
             # SGLang's native endpoint with the chat template already applied (the exact string the OpenAI layer
             # renders for one image + one text part): the tokenizer manager skips request validation and Jinja
@@ -268,6 +278,7 @@ class AsyncKeepAlivePool:
             body = json.dumps({
                 "text": PROMPT_TEMPLATE.format(prompt),
                 "image_data": image_url,
+                **({"rid": rid} if rid else {}),
                 "sampling_params": {"temperature": 0.0, "max_new_tokens": MAX_TOKENS},
             }).encode("utf-8")
             path = "/generate"
@@ -325,7 +336,9 @@ class AsyncKeepAlivePool:
                     except Exception:
                         pass
                     if attempt == 2:
+                        self.n_fail += 1
                         raise
+                    self.n_retry += 1
                     continue
                 if keep_alive:
                     self._idle.append((reader, writer))
@@ -397,7 +410,11 @@ def prepare_job_items(items: list[dict[str, Any]], folder: Path, mode: str) -> l
             "image_url": image_url,
         })
     if STAGE >= 1:
-        prepared.sort(key=lambda x: (x["bucket_rank"], -x["area"]))
+        # Two-stage flow shop (ViT, then decode; the ViT stream is the bottleneck early on). Johnson's rule: jobs whose
+        # decode work exceeds their ViT work (tables: long HTML) first, in INCREASING ViT cost so decode fills up fast;
+        # then the rest (texts, then formulas) in decreasing size. TRACK2_TABLE_ORDER=desc restores largest-first.
+        tsign = -1 if os.environ.get("TRACK2_TABLE_ORDER", "asc") == "desc" else 1
+        prepared.sort(key=lambda x: (x["bucket_rank"], (tsign if x["bucket_rank"] == 0 else -1) * x["area"]))
     return prepared
 
 
@@ -405,9 +422,12 @@ async def infer_crop_async(pool: AsyncKeepAlivePool, prep: dict[str, Any]) -> tu
     cid = prep["id"]
     task_key = prep["task_key"]
     try:
-        raw = await pool.post_chat(prep["image_url"], prep["prompt"])
-        return cid, sanitize_output(raw, task_key)
+        raw = await pool.post_chat(prep["image_url"], prep["prompt"], prep.get("rid"))
+        out = sanitize_output(raw, task_key)
+        prep["_fixed"] = out != raw
+        return cid, out
     except Exception as e:
+        prep["_failed"] = f"{type(e).__name__}: {str(e)[:120]}"
         log(f"crop {cid} failed: {e}")
         return cid, ""
 
@@ -452,18 +472,22 @@ async def run_manifest_async(
     prof_dir = os.environ.get("T2_PROF")
     t_send: dict[str, float] = {}
     t_done: dict[str, float] = {}
+    retry0, fail0 = pool.n_retry, pool.n_fail
 
     async def one(p: dict[str, Any]) -> tuple[str, str]:
-        if prof_dir:
-            t_send[p["id"]] = time.perf_counter()
+        t_send[p["id"]] = time.perf_counter()
         r = await infer_crop_async(pool, p)
-        if prof_dir:
-            t_done[p["id"]] = time.perf_counter()
+        t_done[p["id"]] = time.perf_counter()
         return r
 
     tasks = []
     first = SEND_FIRST if STAGE >= 1 else len(scheduled)
+    global _JOB_NO
+    _JOB_NO += 1
     for i, p in enumerate(scheduled):
+        # rank in the request id: the scheduler keeps its waiting queue (and the ViT prefetch queue) in this order,
+        # whatever order the tokenizer manager finishes the requests in (gravity_ocr/vit_prefetch.py)
+        p["rid"] = f"t2r{i:05d}j{_JOB_NO}"
         tasks.append(asyncio.ensure_future(one(p)))
         if SEND_GAP_S > 0 and i + 1 >= first and (i + 1 - first) % SEND_WAVE == 0 and i + 1 < len(scheduled):
             await asyncio.sleep(SEND_GAP_S)
@@ -487,7 +511,38 @@ async def run_manifest_async(
         f"manifest {folder.name}: {len(items)} crops in {t_infer - t0:.3f}s "
         f"(prep={t_prep - t0:.3f}s, infer={t_infer - t_prep:.3f}s, ipc={IPC_MODE}, async_conns={pool.max_conns})"
     )
+    if _t2log is not None:
+        _log_client_job(folder.name, scheduled, results_map, t0, t_prep, t_infer, t_send, t_done,
+                        pool.n_retry - retry0, pool.n_fail - fail0)
     return [(m["id"], results_map.get(m["id"], "")) for m in items]
+
+
+def _log_client_job(name, scheduled, results_map, t0, t_prep, t_infer, t_send, t_done, retries, fails) -> None:
+    """L1 (client) of the multi-layer run log: one summary line per job + per-request records (TRACK2_LOG >= 2)."""
+    rows = []
+    for rank, p in enumerate(scheduled):
+        cid = p["id"]
+        rows.append({"id": cid, "rank": rank, "task": p["task_key"], "area": p["area"],
+                     "send": round(t_send.get(cid, t_prep), 5), "done": round(t_done.get(cid, t_infer), 5),
+                     "chars": len(results_map.get(cid, "")), "fixed": bool(p.get("_fixed")),
+                     "failed": p.get("_failed", "")})
+        _t2log.record("L1", {"job": name, **rows[-1]})
+    by_task = {}
+    for t in ("table", "text", "formula"):
+        d = [r["done"] - t_prep for r in rows if r["task"] == t]
+        if d:
+            by_task[t] = {"n": len(d), "done_s_p50_p90_max": _t2log.q(d, 0.5, 0.9, 1.0)}
+    last = sorted(rows, key=lambda r: -r["done"])[:5]
+    _t2log.emit("L1", {
+        "job": name, "crops": len(rows), "t_start": round(t0, 4), "t_sent0": round(t_prep, 4),
+        "wall_s": round(t_infer - t0, 4), "prep_s": round(t_prep - t0, 4),
+        "send_span_s": round(max(t_send.values()) - t_prep, 4) if t_send else None,
+        "empty": sum(1 for r in rows if not r["chars"]), "failed": sum(1 for r in rows if r["failed"]),
+        "retries": retries, "socket_failures": fails, "normalized": sum(1 for r in rows if r["fixed"]),
+        "by_task": by_task,
+        "last": [[r["id"][:40], r["task"], r["rank"], round(r["done"] - t_prep, 3)] for r in last],
+    })
+    _t2log.flush()
 
 
 async def warmup_async(pool: AsyncKeepAlivePool) -> None:

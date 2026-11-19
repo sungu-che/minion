@@ -43,8 +43,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export TRACK2_SLICE_DIR="${TRACK2_SLICE_DIR:-${REPO_ROOT}/vocab_slices}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
+# Default: own launch with online FP8 (W8A8: per-channel weights, per-token dynamic activations; LLM + ViT linears,
+# lm_head stays BF16). TRACK2_OWN_LAUNCH=0 runs the image's serve.sh (BF16, no extra server flags).
+export TRACK2_OWN_LAUNCH="${TRACK2_OWN_LAUNCH:-1}"
+export TRACK2_SGLANG_ARGS="${TRACK2_SGLANG_ARGS---quantization fp8}"
+
 STOCK_SERVE="${TRIDA_STACK:-/opt/trida-stack}/inference/gravityocr/serve.sh"
-if [[ "${TRACK2_OWN_LAUNCH:-0}" != 1 && -f "${STOCK_SERVE}" ]]; then
+if [[ "${TRACK2_OWN_LAUNCH}" != 1 && -f "${STOCK_SERVE}" ]]; then
     exec bash "${STOCK_SERVE}" "$@"
 fi
 

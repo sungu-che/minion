@@ -7,6 +7,7 @@
 //        rust_gpu/kernels/track2_cuda_sm89.cu -o gravity_ocr/_native/libtrack2_cuda_sm89.so
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -410,10 +411,339 @@ gk_bf16_argmax_cs_kernel(
     }
 }
 
+// =============================================================================================
+// v6 fused kernels for the W8A8 FP8 path (per-channel weights, per-token dynamic activations).
+// Every kernel reproduces the arithmetic of the kernels it replaces, so its outputs are bitwise
+// equal to the unfused SGLang path (checked by tools/test_fused_kernels.py on the box).
+// =============================================================================================
+__device__ __forceinline__ void t2_unpack8(const uint4 v, float f[8]) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 t = __bfloat1622float2(h[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+__device__ __forceinline__ uint4 t2_pack8(const float f[8]) {
+    uint4 v;
+    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    return v;
+}
+
+__device__ __forceinline__ uint4 t2_shfl_xor_u4(const uint4 a, int m) {
+    uint4 b;
+    b.x = __shfl_xor_sync(0xffffffffu, a.x, m);
+    b.y = __shfl_xor_sync(0xffffffffu, a.y, m);
+    b.z = __shfl_xor_sync(0xffffffffu, a.z, m);
+    b.w = __shfl_xor_sync(0xffffffffu, a.w, m);
+    return b;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. gk_vis_qk_norm_rope_inplace: K2 without the split copies.
+//    qkv [S, 3, H, 64] bf16 (the qkv_proj output) is updated IN PLACE: Q and K heads get the
+//    head RMSNorm + NeoX 2D RoPE, V is not touched. The caller hands FA2-varlen / SDPA strided
+//    views of qkv (last dim contiguous), so the [S, H, 64] q / k / v copies of K2 disappear.
+//    Thread layout: 8 threads per (token, part, head), thread t owns dims [8t, 8t + 8) as one
+//    16-byte vector; its NeoX partner dims (+-32) live in thread t ^ 4 (one shuffle).
+//    Bitwise equal to gk_vis_qkv_sdpa_bf16_kernel: the sum of squares replays K2's butterfly
+//    (old lane d = 8 (t & 3) + e: xor 16 -> thread t ^ 2, xor 8 -> t ^ 1, xor 4 / 2 / 1 inside
+//    the thread) and every product / fma is the same expression.
+// ---------------------------------------------------------------------------------------------
+template <bool COS_BF16>
+__global__ void __launch_bounds__(256)
+gk_vis_qk_norm_rope_inplace_kernel(
+    __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ qn,
+    const __nv_bfloat16* __restrict__ kn,
+    const void* __restrict__ cos_ptr,
+    const void* __restrict__ sin_ptr,
+    float eps,
+    int S,
+    int H
+) {
+    const int per_tok = H * 16;                 // 2 parts x H heads x 8 threads
+    const int64_t total = (int64_t)S * per_tok; // multiple of 32 for even H: warp-uniform trips
+    const int64_t gstride = (int64_t)gridDim.x * blockDim.x;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gstride) {
+        const int s = (int)(i / per_tok);
+        const int r = (int)(i - (int64_t)s * per_tok);
+        const int part = r / (H * 8);           // 0 = Q, 1 = K
+        const int h = (r >> 3) % H;
+        const int t = r & 7;
+        uint4* p = reinterpret_cast<uint4*>(qkv + ((int64_t)s * 3 + part) * (int64_t)(H * 64) + (int64_t)h * 64) + t;
+        const uint4 a = *p;
+        const uint4 b = t2_shfl_xor_u4(a, 4);
+        float x[8], y[8];
+        t2_unpack8(a, x);
+        t2_unpack8(b, y);
+        const bool lo = t < 4;
+        float pp[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) pp[e] = lo ? fmaf(x[e], x[e], y[e] * y[e]) : fmaf(y[e], y[e], x[e] * x[e]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) pp[e] += __shfl_xor_sync(0xffffffffu, pp[e], 2);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) pp[e] += __shfl_xor_sync(0xffffffffu, pp[e], 1);
+        const float ss = ((pp[0] + pp[4]) + (pp[2] + pp[6])) + ((pp[1] + pp[5]) + (pp[3] + pp[7]));
+        const float inv_rms = 1.0f / sqrtf(ss * (1.0f / 64.0f) + eps);
+
+        const __nv_bfloat16* wn = (part == 0) ? qn : kn;
+        float wo[8], wp[8];
+        t2_unpack8(*reinterpret_cast<const uint4*>(wn + 8 * t), wo);
+        t2_unpack8(*reinterpret_cast<const uint4*>(wn + 8 * (t ^ 4)), wp);
+
+        float c[8], sn[8];
+        const int64_t cs = (int64_t)s * 64 + 8 * t;
+        if constexpr (COS_BF16) {
+            t2_unpack8(*reinterpret_cast<const uint4*>((const __nv_bfloat16*)cos_ptr + cs), c);
+            t2_unpack8(*reinterpret_cast<const uint4*>((const __nv_bfloat16*)sin_ptr + cs), sn);
+        } else {
+            const float4* cp = reinterpret_cast<const float4*>((const float*)cos_ptr + cs);
+            const float4* sp = reinterpret_cast<const float4*>((const float*)sin_ptr + cs);
+            const float4 c0 = cp[0], c1 = cp[1], s0 = sp[0], s1 = sp[1];
+            c[0] = c0.x; c[1] = c0.y; c[2] = c0.z; c[3] = c0.w; c[4] = c1.x; c[5] = c1.y; c[6] = c1.z; c[7] = c1.w;
+            sn[0] = s0.x; sn[1] = s0.y; sn[2] = s0.z; sn[3] = s0.w; sn[4] = s1.x; sn[5] = s1.y; sn[6] = s1.z; sn[7] = s1.w;
+        }
+        float o[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float ho = x[e] * inv_rms * wo[e];
+            const float hp = y[e] * inv_rms * wp[e];
+            // K2: out[d] = fmaf(h[d], cos[d], -h[d+32] * sin[d]); out[d+32] = fmaf(h[d+32], cos[d+32], h[d] * sin[d+32])
+            o[e] = lo ? fmaf(ho, c[e], -hp * sn[e]) : fmaf(ho, c[e], hp * sn[e]);
+        }
+        *p = t2_pack8(o);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. gk_silu_mul_quant_fp8: y = bf16(silu(gate) * up) (flashinfer act_and_mul with sgl-kernel's
+//    silu<float>), then sgl-kernel's per-token FP8 quant of y (scale = max|y| / 448, e4m3 with
+//    saturation), in one pass: gate_up is read once, y never touches memory.
+//    One 128-thread CTA per row; each thread keeps up to MAXV 8-element vectors of y in registers.
+//    ACT selects the silu arithmetic, QNT the scale arithmetic (both picked by the bitwise test).
+// ---------------------------------------------------------------------------------------------
+template <int ACT>
+__device__ __forceinline__ float t2_silu(float v) {
+    if constexpr (ACT == 0) {
+        return v / (1.0f + expf(-v));
+    } else {
+        return __fdividef(v, 1.0f + __expf(-v));
+    }
+}
+
+__device__ __forceinline__ float t2_block_max128(float v, float* red) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    return fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+}
+
+template <int QNT>
+__device__ __forceinline__ void t2_fp8_scale(float amax, float& s, float& sinv) {
+    if constexpr (QNT == 0) {
+        s = amax / 448.0f;
+        sinv = (s == 0.0f) ? 0.0f : 1.0f / s;
+    } else if constexpr (QNT == 1) {
+        s = amax / 448.0f;
+        sinv = (amax == 0.0f) ? 0.0f : 448.0f / amax;
+    } else {
+        s = amax * (1.0f / 448.0f);
+        sinv = (s == 0.0f) ? 0.0f : 1.0f / s;
+    }
+}
+
+__device__ __forceinline__ uint2 t2_quant8(const float f[8], float sinv) {
+    uint2 out;
+    uint8_t* b = reinterpret_cast<uint8_t*>(&out);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float v = fmaxf(fminf(f[e] * sinv, 448.0f), -448.0f);
+        b[e] = (uint8_t)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    }
+    return out;
+}
+
+template <int MAXV, int ACT, int QNT>
+__global__ void __launch_bounds__(128)
+gk_silu_mul_quant_fp8_kernel(
+    const __nv_bfloat16* __restrict__ gu,
+    int64_t gu_stride,
+    uint8_t* __restrict__ q,
+    float* __restrict__ scale,
+    int I
+) {
+    __shared__ float red[4];
+    const int m = blockIdx.x;
+    const __nv_bfloat16* g = gu + (int64_t)m * gu_stride;
+    const __nv_bfloat16* u = g + I;
+    const int nv = I >> 3;
+    uint4 yv[MAXV];
+    float amax = 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAXV; ++k) {
+        const int v = threadIdx.x + k * 128;
+        if (v < nv) {
+            float gf[8], uf[8], r[8];
+            t2_unpack8(reinterpret_cast<const uint4*>(g)[v], gf);
+            t2_unpack8(reinterpret_cast<const uint4*>(u)[v], uf);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) r[e] = t2_silu<ACT>(gf[e]) * uf[e];
+            yv[k] = t2_pack8(r);
+            float rb[8];
+            t2_unpack8(yv[k], rb);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(rb[e]));
+        }
+    }
+    amax = t2_block_max128(amax, red);
+    float s, sinv;
+    t2_fp8_scale<QNT>(amax, s, sinv);
+    if (threadIdx.x == 0) scale[m] = s;
+#pragma unroll
+    for (int k = 0; k < MAXV; ++k) {
+        const int v = threadIdx.x + k * 128;
+        if (v < nv) {
+            float rb[8];
+            t2_unpack8(yv[k], rb);
+            reinterpret_cast<uint2*>(q + (int64_t)m * I)[v] = t2_quant8(rb, sinv);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 6. gk_quant_fp8_rows: the per-token FP8 quant alone (same arithmetic as 5), for the test /
+//    for callers that already hold the bf16 activations.
+// ---------------------------------------------------------------------------------------------
+template <int MAXV, int QNT>
+__global__ void __launch_bounds__(128)
+gk_quant_fp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t x_stride, uint8_t* __restrict__ q,
+                         float* __restrict__ scale, int K) {
+    __shared__ float red[4];
+    const int m = blockIdx.x;
+    const __nv_bfloat16* row = x + (int64_t)m * x_stride;
+    const int nv = K >> 3;
+    uint4 xv[MAXV];
+    float amax = 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAXV; ++k) {
+        const int v = threadIdx.x + k * 128;
+        if (v < nv) {
+            xv[k] = reinterpret_cast<const uint4*>(row)[v];
+            float f[8];
+            t2_unpack8(xv[k], f);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(f[e]));
+        }
+    }
+    amax = t2_block_max128(amax, red);
+    float s, sinv;
+    t2_fp8_scale<QNT>(amax, s, sinv);
+    if (threadIdx.x == 0) scale[m] = s;
+#pragma unroll
+    for (int k = 0; k < MAXV; ++k) {
+        const int v = threadIdx.x + k * 128;
+        if (v < nv) {
+            float f[8];
+            t2_unpack8(xv[k], f);
+            reinterpret_cast<uint2*>(q + (int64_t)m * K)[v] = t2_quant8(f, sinv);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // C-ABI entrypoints called via ctypes on PyTorch's active cudaStream_t (CUDA Graph safe!)
 // ---------------------------------------------------------------------------------------------
 extern "C" {
+
+// v6: ABI version of the fused kernels (bump on any signature change)
+int track2_fused_abi(void) { return 1; }
+
+int track2_vis_qk_norm_rope_inplace(
+    void* qkv_bf16, const void* qn_bf16, const void* kn_bf16, const void* cos_ptr, const void* sin_ptr,
+    int cos_is_bf16, float eps, int S, int H, void* stream_ptr
+) {
+    if (S <= 0 || H <= 0) return 0;
+    if (H & 1) return 1001;  // warp-uniform shuffles need an even head count
+    const int64_t total = (int64_t)S * H * 16;
+    int64_t blocks = (total + 255) / 256;
+    if (blocks > 142 * 12) blocks = 142 * 12;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    if (cos_is_bf16) {
+        gk_vis_qk_norm_rope_inplace_kernel<true><<<(int)blocks, 256, 0, stream>>>(
+            (__nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16, cos_ptr, sin_ptr, eps, S, H);
+    } else {
+        gk_vis_qk_norm_rope_inplace_kernel<false><<<(int)blocks, 256, 0, stream>>>(
+            (__nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16, cos_ptr, sin_ptr, eps, S, H);
+    }
+    return (int)cudaGetLastError();
+}
+
+#define T2_SMQ_CASE(MV, A, Q)                                                                          \
+    gk_silu_mul_quant_fp8_kernel<MV, A, Q><<<M, 128, 0, stream>>>((const __nv_bfloat16*)gate_up_bf16,  \
+                                                                  gu_stride, (uint8_t*)q_e4m3, (float*)scale_f32, I)
+
+int track2_silu_mul_quant_fp8(
+    const void* gate_up_bf16, int64_t gu_stride, void* q_e4m3, void* scale_f32, int M, int I, int act_mode,
+    int qnt_mode, void* stream_ptr
+) {
+    if (M <= 0) return 0;
+    if (I <= 0 || (I & 7) || I > 128 * 8 * 6) return 1002;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const int nv = I >> 3;
+    const int mv = (nv + 127) / 128;
+    const int key = act_mode * 10 + qnt_mode;
+    if (mv <= 4) {
+        switch (key) {
+            case 0: T2_SMQ_CASE(4, 0, 0); break;
+            case 1: T2_SMQ_CASE(4, 0, 1); break;
+            case 2: T2_SMQ_CASE(4, 0, 2); break;
+            case 10: T2_SMQ_CASE(4, 1, 0); break;
+            case 11: T2_SMQ_CASE(4, 1, 1); break;
+            case 12: T2_SMQ_CASE(4, 1, 2); break;
+            default: return 1003;
+        }
+    } else {
+        switch (key) {
+            case 0: T2_SMQ_CASE(6, 0, 0); break;
+            case 1: T2_SMQ_CASE(6, 0, 1); break;
+            case 2: T2_SMQ_CASE(6, 0, 2); break;
+            case 10: T2_SMQ_CASE(6, 1, 0); break;
+            case 11: T2_SMQ_CASE(6, 1, 1); break;
+            case 12: T2_SMQ_CASE(6, 1, 2); break;
+            default: return 1003;
+        }
+    }
+    return (int)cudaGetLastError();
+}
+
+int track2_quant_fp8_rows(
+    const void* x_bf16, int64_t x_stride, void* q_e4m3, void* scale_f32, int M, int K, int qnt_mode, void* stream_ptr
+) {
+    if (M <= 0) return 0;
+    if (K <= 0 || (K & 7) || K > 128 * 8 * 6) return 1002;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const int mv = ((K >> 3) + 127) / 128;
+    const __nv_bfloat16* x = (const __nv_bfloat16*)x_bf16;
+    uint8_t* q = (uint8_t*)q_e4m3;
+    float* s = (float*)scale_f32;
+    if (mv <= 4) {
+        if (qnt_mode == 0) gk_quant_fp8_rows_kernel<4, 0><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else if (qnt_mode == 1) gk_quant_fp8_rows_kernel<4, 1><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else gk_quant_fp8_rows_kernel<4, 2><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+    } else {
+        if (qnt_mode == 0) gk_quant_fp8_rows_kernel<6, 0><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else if (qnt_mode == 1) gk_quant_fp8_rows_kernel<6, 1><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+        else gk_quant_fp8_rows_kernel<6, 2><<<M, 128, 0, stream>>>(x, x_stride, q, s, K);
+    }
+    return (int)cudaGetLastError();
+}
 
 int track2_u8_norm_bf16(
     const void* src_u8,

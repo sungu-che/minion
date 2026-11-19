@@ -34,9 +34,28 @@ BATCH_IMAGES = int(os.environ.get("TRACK2_VIT_PF_IMAGES", "64"))
 # Batches queued on the ViT stream at once. Queuing everything fills the driver's launch queue: cudaLaunchKernel then
 # blocks the scheduler thread (and every decode launch) until the GPU drains it.
 MAX_INFLIGHT = int(os.environ.get("TRACK2_VIT_PF_INFLIGHT", "2"))
+RANK_ORDER = os.environ.get("TRACK2_RANK_ORDER", "1") == "1"
 SCHED_PRIORITY = int(os.environ.get("TRACK2_SCHED_STREAM_PRIORITY", "-10"))
 
 _PF: Optional["VitPrefetcher"] = None
+
+try:  # multi-layer run log, ViT layer (L4)
+    from gravity_ocr import t2log as _LOG
+    if _LOG.LEVEL < 1:
+        _LOG = None
+except Exception:
+    _LOG = None
+
+
+def req_rank(req) -> int:
+    """the client's scheduling rank, carried in the request id ("t2r<rank:05d>j<job>"); unranked requests go last."""
+    rid = getattr(req, "rid", None)
+    if isinstance(rid, str) and rid.startswith("t2r"):
+        try:
+            return int(rid[3:8])
+        except ValueError:
+            pass
+    return 1 << 30
 
 
 def is_desc(item) -> bool:
@@ -68,6 +87,7 @@ class VitPrefetcher:
                                         priority=int(os.environ.get("TRACK2_VIT_STREAM_PRIORITY", "0")))
         self.pending: collections.deque = collections.deque()
         self.inflight: collections.deque = collections.deque()  # events of launched, possibly unfinished batches
+        self._ondemand_now = False
         self.n_batches = 0
         self.n_items = 0
         self.n_ondemand = 0
@@ -76,6 +96,7 @@ class VitPrefetcher:
 
     # ------------------------------------------------------------------ submission (scheduler thread)
     def submit_reqs(self, reqs) -> None:
+        added = False
         for req in reqs:
             if getattr(req, "_t2_pf", False):
                 continue
@@ -84,10 +105,16 @@ class VitPrefetcher:
             items = getattr(mm, "mm_items", None) if mm is not None else None
             if not items:
                 continue
+            rank = req_rank(req)
             for it in items:
                 if getattr(it, "_t2_state", 0) == 0 and is_desc(it):
                     it._t2_state = 1  # queued
+                    it._t2_rank = rank
                     self.pending.append(it)
+                    added = True
+        if added and len(self.pending) > 1:
+            # encode in the client's rank order, not in the order the tokenizer manager happened to finish requests
+            self.pending = collections.deque(sorted(self.pending, key=lambda it: it._t2_rank))
 
     def pump(self) -> None:
         """Keep up to MAX_INFLIGHT packed batches queued on the ViT stream (non-blocking: completion is polled)."""
@@ -111,11 +138,13 @@ class VitPrefetcher:
         # its own stream's buffers (the caching allocator never hands this stream a block freed by another stream).
         t0 = time.perf_counter()
         with torch.cuda.stream(self.stream):
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev0.record(self.stream)
             pixel_values, grid_thw = self.preprocess(items)
             out = self.model.visual(pixel_values, grid_thw=grid_thw)
             counts = [int(g[1] * g[2]) // 4 for g in grid_thw.tolist()] if grid_thw.dim() == 2 else [out.shape[0]]
             parts = torch.split(out, counts, dim=0) if len(items) > 1 else (out,)
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(enable_timing=True)
             ev.record(self.stream)
         for it, e in zip(items, parts):
             it._t2_emb = e
@@ -124,7 +153,11 @@ class VitPrefetcher:
         self.n_batches += 1
         self.n_items += len(items)
         self.n_patches += sum(int(g[1] * g[2]) for g in grid_thw.tolist())
-        self.t_launch += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        self.t_launch += dt
+        if _LOG is not None:
+            _LOG.SCHED.vit_batch(len(items), sum(int(g[1] * g[2]) for g in grid_thw.tolist()), 1e3 * dt, ev0, ev,
+                                 self._ondemand_now)
         if self.n_batches in (1, 10, 100) or self.n_batches % 1000 == 0:
             self.log(f"[track2-vit-prefetch] batches={self.n_batches} images={self.n_items} patches={self.n_patches} "
                      f"on_demand={self.n_ondemand} host_launch={self.t_launch:.3f}s")
@@ -138,8 +171,12 @@ class VitPrefetcher:
             if self.pending:
                 self.pending = collections.deque(it for it in self.pending if id(it) not in ids)
             self.n_ondemand += len(todo)
-            for i in range(0, len(todo), BATCH_IMAGES):
-                self.inflight.append(self._encode(todo[i : i + BATCH_IMAGES]))
+            self._ondemand_now = True
+            try:
+                for i in range(0, len(todo), BATCH_IMAGES):
+                    self.inflight.append(self._encode(todo[i : i + BATCH_IMAGES]))
+            finally:
+                self._ondemand_now = False
         cur = torch.cuda.current_stream(self.model.visual.device)
         seen = set()
         embs = []
@@ -210,14 +247,20 @@ def tick(sched) -> None:
     wq = getattr(sched, "waiting_queue", None)
     n0 = pf.n_items
     if wq:
+        if RANK_ORDER and len(wq) > 1:
+            # admission follows the client's rank (FCFS without priority scheduling never reorders the queue itself)
+            wq.sort(key=req_rank)
         pf.submit_reqs(wq)
     if pf.pending:
         pf.pump()
     t1 = time.perf_counter() if _TRACE else 0.0
     waited = False
     if wq and sched.chunked_req is None and not sched.running_batch.reqs and not ready(wq[0]):
+        tw = time.perf_counter()
         wait_first(wq[0])  # idle GPU queue otherwise: nothing to decode until the first embeddings exist
         waited = True
+        if _LOG is not None:
+            _LOG.SCHED.vit_wait(1e3 * (time.perf_counter() - tw))
     if _TRACE:
         t2 = time.perf_counter()
         if pf.n_items != n0 or waited or (t2 - t0) > 0.005:

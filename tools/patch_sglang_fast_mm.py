@@ -75,7 +75,12 @@ try:
 except Exception:
     _g_textscale = None
 
-_T2_TRACE = bool(os.environ.get("T2_PROF"))  # diagnostic: per-request timing lines (profiling runs only)
+try:  # multi-layer run log, tokenizer-manager layer (L2)
+    from gravity_ocr import t2log as _T2LOG
+    if _T2LOG.LEVEL < 1:
+        _T2LOG = None
+except Exception:
+    _T2LOG = None
 
 SHM_RING_PATH = "/dev/shm/track2_raw_chw.bin"
 # 1 GB tmpfs ring (~4.6x one 402-crop dev job of raw uint8 CHW; every crop of a job is queued at once). The scheduler
@@ -179,11 +184,13 @@ def _fast_prepare_shm_or_bf16(
 ) -> Optional[Tuple[torch.Tensor, Tuple[int, int]]]:
     if _g_preprocess is None:
         return None
+    _t2_t0 = time.perf_counter()
     chw = _decode_raw_chw_u8(item)
     if chw is None:
         return None
     _, h, w = chw.shape
     th, tw = _g_preprocess.smart_resize(h, w)
+    s = 1.0
     if _g_textscale is not None and task == "text":
         # [TRACK2-TEXT-DOWNSCALE] large-font text crops: same text, fewer ViT patches (one bicubic resample on the GPU)
         s, _why = _g_textscale.text_downscale(chw, task)
@@ -197,7 +204,8 @@ def _fast_prepare_shm_or_bf16(
         if off is not None:
             # 56-byte descriptor: [-99, shm_offset, nbytes, H, W, gh, gw]
             desc = torch.tensor([[-99, off, int(chw.numel()), h, w, gh, gw]], dtype=torch.int64)
-            return desc, (gh, gw)
+            return desc, (gh, gw), {"decode_ms": round(1e3 * (time.perf_counter() - _t2_t0), 2), "scale": round(s, 3),
+                                    "h": h, "w": w}
 
     # Fallback CPU patchify if /dev/shm unavailable
     im = Image.fromarray(chw.permute(1, 2, 0).numpy())
@@ -341,7 +349,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        _t2_tin = time.perf_counter() if _T2_TRACE else 0.0
+        _t2_tin = time.perf_counter()
         if (
             self._fast_mm_enabled
             and image_data
@@ -375,9 +383,10 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 else:
                     res = _fast_prepare_shm_or_bf16(raw_img, self._ss_pv_bf16, self._shm_gpu_enabled, task)
                 if res is not None:
-                    if _T2_TRACE:
-                        print(f"[t2-tm] in={_t2_tin:.4f} out={time.perf_counter():.4f} pid={os.getpid()}", flush=True)
-                    pv, (gh, gw) = res
+                    pv, (gh, gw) = res[0], res[1]
+                    if _T2LOG is not None:
+                        _T2LOG.TM.add({"in": round(_t2_tin, 5), "out": round(time.perf_counter(), 5), "task": task,
+                                       "patches": gh * gw, **(res[2] if len(res) > 2 else {})})
                     head_ids, tail_ids = parts
                     rows, cols = gh // 2, gw // 2
                     n_img = rows * cols

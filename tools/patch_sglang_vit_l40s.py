@@ -463,6 +463,14 @@ def _t2_get_cuda_sm89():
         return pixel_values, image_grid_thw
 
     def _t2_register_prefetch(self):
+        # [TRACK2-T2LOG] multi-layer run log, scheduler layer (gravity_ocr/t2log.py; TRACK2_LOG=0 turns it off)
+        try:
+            import sys as _t2_sys
+            if "sglang.srt.managers.scheduler" in _t2_sys.modules:
+                from gravity_ocr import t2log as _t2l
+                _t2l.install_scheduler()
+        except Exception as _e:
+            print(f"[t2log] scheduler layer failed: {_e}", flush=True)
         # [TRACK2-VIT-PREFETCH] see gravity_ocr/vit_prefetch.py
         self._t2_pf = None
         if _t2_os.environ.get("TRACK2_VIT_PREFETCH", "1") != "1" or self.use_data_parallel:
