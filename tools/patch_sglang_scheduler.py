@@ -68,15 +68,43 @@ def patch_scheduler(src: str) -> str:
     repl_loop = """    def event_loop_normal(self):
         \"\"\"A normal scheduler loop.\"\"\"
         _t2_tick = None
+        self._t2_recv_buf = []
+        _t2_recv_lim = int(__import__("os").environ.get("TRACK2_RECV_LIMIT", "24"))
         if __import__("os").environ.get("TRACK2_VIT_PREFETCH", "1") == "1":
             try:
                 from gravity_ocr import vit_prefetch as _t2_vp
+                _t2_vp.register_sched(self)
                 _t2_tick = _t2_vp.tick
             except Exception as _e:
                 logger.warning(f"[track2-vit-prefetch] tick unavailable: {_e}")
         while True:
-            # Receive requests
-            recv_reqs = self.recv_requests()
+            # Receive requests (prepend any already unpickled behind GPU decode, and cap burst while GPU is busy)
+            if (_t2_recv_lim > 0 and self.running_batch.reqs
+                    and self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0):
+                import zmq as _t2_zmq
+                recv_reqs = self._t2_recv_buf
+                self._t2_recv_buf = []
+                _rem = _t2_recv_lim
+                while _rem > 0:
+                    try:
+                        _r = self.recv_from_tokenizer.recv_pyobj(_t2_zmq.NOBLOCK)
+                        unwrap_shm_features(_r)
+                        recv_reqs.append(_r)
+                        _rem -= 1
+                    except _t2_zmq.ZMQError:
+                        break
+                while True:
+                    try:
+                        _r = self.recv_from_rpc.recv_pyobj(_t2_zmq.NOBLOCK)
+                        unwrap_shm_features(_r)
+                        recv_reqs.append(_r)
+                    except _t2_zmq.ZMQError:
+                        break
+            else:
+                recv_reqs = self.recv_requests()
+                if self._t2_recv_buf:
+                    recv_reqs = self._t2_recv_buf + recv_reqs
+                    self._t2_recv_buf = []
             self.process_input_requests(recv_reqs)
             if _t2_tick is not None:
                 _t2_tick(self)"""
@@ -144,6 +172,42 @@ if __import__("os").environ.get("TRACK2_VIT_PREFETCH", "1") == "1":
     if anchor not in src:
         raise RuntimeError("Could not locate _get_new_batch_prefill_raw in scheduler.py")
     return src.replace(anchor, helper + anchor, 1)
+
+
+def patch_output_processor(src: str) -> str:
+    """Hide ViT kernel launch and ZMQ unpickling behind EXTEND's GPU wait in process_batch_result_prefill."""
+    marker = "# [TRACK2-EXTEND-HIDE]"
+    if marker in src:
+        return src
+    hdr_anchor = "logger = logging.getLogger(__name__)\n"
+    if hdr_anchor not in src:
+        raise RuntimeError("Could not locate logger in scheduler_output_processor_mixin.py")
+    hdr = hdr_anchor + """
+# [TRACK2-EXTEND-HIDE] hide ViT launch & ZMQ unpickling behind EXTEND's GPU completion wait
+_T2_EXTEND_HIDE = __import__("os").environ.get("TRACK2_EXTEND_HIDE", "1") == "1"
+try:
+    from gravity_ocr.vit_prefetch import pump_behind_decode as _t2_ext_pump
+except Exception:
+    _t2_ext_pump = None
+"""
+    src = src.replace(hdr_anchor, hdr, 1)
+    old = """        if self.is_generation:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()"""
+    new = """        if self.is_generation:
+            if _T2_EXTEND_HIDE and _t2_ext_pump is not None:  # [TRACK2-EXTEND-HIDE]
+                _ev = result.copy_done
+                if _ev is None:
+                    _ev = getattr(self, "_t2_ext_ev", None)
+                    if _ev is None:
+                        _ev = self._t2_ext_ev = torch.cuda.Event()
+                    _ev.record(torch.cuda.current_stream())
+                _t2_ext_pump(_ev)
+            if result.copy_done is not None:
+                result.copy_done.synchronize()"""
+    if src.count(old) != 1:
+        raise RuntimeError(f"Expected 1 process_batch_result_prefill anchor, found {src.count(old)}")
+    return src.replace(old, new, 1)
 
 
 def main() -> None:

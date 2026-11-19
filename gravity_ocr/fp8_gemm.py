@@ -23,6 +23,11 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from gravity_ocr import cutlass_f16 as _CUTLASS_F16
+except Exception:
+    _CUTLASS_F16 = None
+
 _ENABLED = os.environ.get("TRACK2_FP8_GEMM_TRITON", "1") == "1"
 # [TRACK2-JIT-STABLE] avoid M%16 specialization recompiles inside timed prefill batches (bit-identical)
 _JIT_STABLE = os.environ.get("TRACK2_JIT_STABLE", "1") == "1"
@@ -133,24 +138,54 @@ def _mm_f16(a_ptr, b_ptr, sa_ptr, sb_ptr, c_ptr, bias_ptr, M, N, K, stride_am, s
 
 
 def f16_rule(M: int, N: int, K: int):
-    """Tuned L40S sm_89 tile (BM, BN, BK, warps, stages) where _mm_f16 beats CUTLASS FP32-accum by 1.10x-1.16x."""
+    """L40S sm_89 sweep-verified tiles (BM, BN, BK, warps, stages) strictly beating CUTLASS FP32-accum (1.03x-1.53x)."""
     if K == 1024:
-        if N == 8192 and M >= 512:          # ViT gate_up_proj
-            return (256, 128, 128, 8, 3) if M >= 2048 else (128, 256, 128, 8, 3)
-        if N == 3072 and M >= 512:          # ViT qkv_proj
-            return (128, 256, 128, 8, 3) if M >= 1024 else (128, 128, 128, 4, 3)
+        if N == 8192:                       # ViT gate_up_proj
+            if 512 <= M <= 2048 or M >= 12000:
+                return (256, 128, 128, 8, 3)
+            return None
+        if N == 3072:                       # ViT qkv_proj
+            if 512 <= M <= 2048:
+                return (64, 128, 128, 4, 3)
+            if 2048 < M <= 6144:
+                return (256, 128, 128, 8, 3)
+            if 6144 < M <= 12000:
+                return (128, 128, 128, 4, 3)
+            return None
         return None
     if K == 1536:
-        if N == 9216 and M >= 512:          # LM gate_up_proj
-            return (256, 128, 128, 8, 3) if M >= 1536 else (128, 256, 128, 8, 3)
-        if N == 4096 and M >= 512:          # LM qkv_proj
-            return (256, 128, 128, 8, 3) if M >= 1536 else (128, 128, 128, 4, 3)
+        if N == 9216:                       # LM gate_up_proj (1.09x-1.39x; CUTLASS wins 2400..3500)
+            if 128 < M <= 256:
+                return (64, 128, 128, 4, 3)
+            if 256 < M <= 512:
+                return (64, 256, 128, 8, 3)
+            if 512 < M <= 1024:
+                return (128, 256, 128, 8, 3)
+            if 1024 < M <= 2400:
+                return (128, 128, 128, 8, 3)
+            if M > 3500:
+                return (128, 128, 128, 4, 3)
+            return None
+        if N == 4096:                       # LM qkv_proj
+            if 1200 <= M <= 2400:
+                return (128, 128, 128, 8, 3)
+            if M > 2400:
+                return (256, 128, 128, 8, 3)
+            return None
         return None
     if N == 1536:
-        if K == 4608 and M >= 256:          # LM down_proj
-            return (128, 128, 128, 4, 3) if M >= 1024 else (64, 128, 128, 4, 4)
-        if K == 2048 and M >= 256:          # LM o_proj
-            return (64, 128, 128, 4, 4)
+        if K == 4608:                       # LM down_proj (1.53x at 1600; CUTLASS wins elsewhere)
+            if 1100 <= M <= 2400:
+                return (256, 128, 128, 8, 3)
+            return None
+        if K == 2048:                       # LM o_proj (1.29x at 400, 1.11x at 1600, 1.05x at 3200)
+            if 256 < M <= 512:
+                return (64, 128, 128, 4, 4)
+            if 1100 <= M <= 2400:
+                return (256, 128, 128, 8, 3)
+            if 2400 < M <= 3400:
+                return (64, 128, 128, 4, 4)
+            return None
     return None
 
 
@@ -166,15 +201,24 @@ def rescale_f16_weight(layer, shift: float = 32.0) -> None:
 
 
 def mm_f16(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-    """Dispatch to Ada sm_89 FP16-accum FP8 GEMM on winning shapes (inputs must be QNT=3, weights shift=32), else fallback."""
+    """Dispatch to Ada sm_89 FP16-accum FP8 GEMM (CUTLASS 4.4.2 EVT first, then Triton, else CUTLASS FP32 fallback)."""
     if (out_dtype == torch.bfloat16 and mat_a.dim() == 2 and mat_b.dim() == 2
             and mat_a.dtype == torch.float8_e4m3fn and mat_b.dtype == torch.float8_e4m3fn
             and mat_a.stride(1) == 1 and mat_b.stride(0) == 1
             and scales_a.dtype == torch.float32 and scales_b.dtype == torch.float32
             and scales_a.is_contiguous() and scales_b.is_contiguous()):
+        if _CUTLASS_F16 is not None:
+            out = _CUTLASS_F16.mm(mat_a, mat_b, scales_a, scales_b, bias)
+            if out is not None:
+                return out
         M, K = mat_a.shape
         N = mat_b.shape[1]
-        cfg = f16_rule(M, N, K)
+        # When native CUTLASS FP16-accum is active, only keep Triton for shapes where Triton beats BOTH CUTLASS
+        # FP16-accum and sgl_kernel FP32-accum (ViT_gate_up M > 12000: 690us vs 735us / 941us = 1.36x).
+        if _CUTLASS_F16 is not None and _CUTLASS_F16.available():
+            cfg = (256, 128, 128, 8, 3) if (K == 1024 and N == 8192 and M > 12000) else None
+        else:
+            cfg = f16_rule(M, N, K)
         if cfg is not None and K % cfg[2] == 0:
             bm, bn, bk, w, s = cfg
             out = torch.empty((M, N), dtype=torch.bfloat16, device=mat_a.device)

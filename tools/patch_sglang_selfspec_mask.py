@@ -458,6 +458,35 @@ def patch_draft_kernel(src: str) -> str:
     return patch_kv_nosplit(src)
 
 
+def patch_fast_commit(src: str) -> str:
+    """Inject ViT launch hiding right between self.event.record() and self.event.synchronize() in SelfSpecFastCommit."""
+    marker = "# [TRACK2-VIT-HIDE-LAUNCH]"
+    if marker in src:
+        return src
+    hdr_anchor = "logger = logging.getLogger(__name__)\n"
+    if hdr_anchor not in src:
+        raise RuntimeError("Could not locate logger in selfspec_fast_commit.py")
+    hdr = hdr_anchor + """
+# [TRACK2-VIT-HIDE-LAUNCH] hide ViT kernel launch (~9ms/batch) behind decode's event.synchronize() GPU wait
+try:
+    from gravity_ocr.vit_prefetch import pump_behind_decode as _t2_vit_pump
+except Exception:
+    _t2_vit_pump = None
+"""
+    src = src.replace(hdr_anchor, hdr, 1)
+    old = "        self.event.record()\n        self.event.synchronize()            # the round's only readback"
+    new = (
+        "        self.event.record()\n"
+        "        if _t2_vit_pump is not None:        # [TRACK2-VIT-HIDE-LAUNCH]\n"
+        "            _t2_vit_pump(self.event)\n"
+        "        self.event.synchronize()            # the round's only readback"
+    )
+    cnt = src.count(old)
+    if cnt != 2:
+        raise RuntimeError(f"Expected 2 self.event.synchronize() sites in selfspec_fast_commit.py, found {cnt}")
+    return src.replace(old, new)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", required=True)

@@ -1,19 +1,18 @@
 # Track 2 (GLM-OCR Speed Run) 진행 정리
 
-작성 시점: 2026-11-20 06:24 KST 기준. 숫자는 별도 표기가 없으면 L40S 박스에서 공식 하네스(`local_run.py`, dev 402 크롭, 3회 중앙값)로 잰 값입니다.
+작성 시점: 2026-11-20 08:34 KST 기준. 숫자는 별도 표기가 없으면 L40S 박스에서 공식 하네스(`local_run.py`, dev 402 크롭, 3회 중앙값)로 잰 값입니다.
 
 ## 1. 현재 상태
 
 | 항목 | 값 |
 |---|---|
-| 이전 리더보드 제출본 | submission 208 (v9a): **test 3.416 s / 품질 97.21**, 통과 |
-| 그 전 제출본 | submission 174 (v7): test 3.905 s / 품질 97.28 |
-| 1위 (team23, 마지막 확인 시점) | 3.152 s / 96.89 (text 96.82 / formula 95.88 / table 97.79) |
-| 최신 후보 **v14** (`~/submission_v14.zip`) | **공식 `local_run.py` 3회 중앙값 2.339 s** (`2.435 / 2.332 / 2.339`), dev 품질 **97.04** (`text 97.12 / table 98.90 / formula 95.09`), 통과 |
+| **현재 라이브 1위 제출본** | **submission 260 (v14)**: **test 2.451 s / 품질 97.18** (`text 97.41 / formula 95.76 / table 98.33`, dev+test `97.12`), 통과 ✓ |
+| 2위 (`track2-team23`, id=245) | test 3.041 s / 품질 96.93 (`text 96.93 / formula 95.79 / table 98.00`) |
+| **신규 제출본 v17** (`~/submission_v17.zip`, **submission 310**) | **공식 `local_run.py` 3회 중앙값 2.268 s** (`2.242 / 2.268 / 2.278`, dev untimed `2.271 s`), 품질 `[97.18, 97.13, 97.04]` / dev `97.17` / combined `97.11` (`text 97.13 / table 98.86 / formula 95.11`, `eligible=1`, `missing=0`) |
 | 통과선 (test 기준) | text ≥ 96.24, formula ≥ 94.88, table ≥ 97.5 |
 
-- 로컬 dev 시간과 공식 test 시간은 v7에서 0.01 s, v9a에서 0.08 s(공식이 더 빠름) 차이였습니다.
-- v14는 `~/teams/v14`, `~/my-team`, `~/submission_v14.zip` (`54.3 MB`)으로 패키징 완료되었으며, `eval_ex_v14` (`100.0 / 0.061 s / eligible=1`) 통과 후 `eval_dev_v14` 최종 채점 진행 중입니다.
+- **submission 260 (v14)**은 공식 비공개 테스트셋 `2.451 s / 97.18`로 2위(`3.041 s`)를 **0.590 s** 앞선 단독 1위이며, Text(`97.41`)와 Dev+Test(`97.12`)는 베이스라인(`97.24` / `97.02`)을 넘어선 전체 최고점입니다.
+- **v17 (submission 310)**은 공식 `local_run.py` 402-크롭 기준 v14(`2.342 s / 97.02`) 대비 **-74 ms 더 빠르면서(`2.268 s`, 최소 `2.242 s`) 정밀도까지 모든 태스크에서 동반 개선(`dev 97.17 / combined 97.11 / text 97.13 / formula 95.11`)**되어 공식 제출 완료되었습니다.
 
 ## 2. 버전별 변화
 
@@ -24,12 +23,15 @@
 | v4 | 4.401 s | 96.92 | FP8 W8A8 전체, ViT 프리페치 오버랩, 1-pass draft 어텐션, FA2 varlen, `/generate`, 출력 정규화 |
 | v7 | 3.895 s | 96.94 | 비트 동일 커널 4종: ViT QKV norm+RoPE in-place, SiLU→FP8 퓨전, M-RoPE 재작성, norm→FP8 퓨전 |
 | v8 | 3.906 s (3.759–4.084) | 96.92 | 레이어 간 norm 체인 퓨전, 비트 동일 Triton GEMM(o/down), seed-mask draft 어텐션 |
-| v9a | 3.492 s | 96.94 | v8 + 크기 정책: 텍스트 줄간격 32 px 정규화, 표 4,096 패치 상한 |
+| v9a | 3.492 s | 96.94 | v8 + 크기 정책: 텍스트 줄간격 32 px 정규화, 표 4,096 패치 상한 (submission 208: test `3.416 s / 97.21`) |
 | v10 | 3.279 s | 96.96 | v9a + draft 전체 어휘, 클라이언트 준비 단축, DONE 이후 정리, GC 가드 |
 | v11 | 2.701 s (warm) | 97.04 (`MC=0: 97.10`) | 5개 리서치 트랙 통합: 글자 높이 정규화(12 px), 여백 크롭(28 px 스냅), KV-nosplit/nofill, JIT 안정화, dens 오더링 |
 | v12 | 2.566 s (warm) | 97.10 (`MC=0: 97.15`) | C 네이티브 CPU 전처리(`libtrack2_cpu_prep.so`, 3.7×), Fused FP8 `lm_head` + 블록 argmax, contiguous M-RoPE, 핀 메모리 링 |
 | v13 | 2.385 s (warm) | 97.05 | Fused M-RoPE + paged KV scatter, 비트 동일 `gate_up` Triton GEMM, `MAXREQ=128 / DRAFT=25` |
-| **v14** | **2.339 s (공식 3회 중앙값)** | **97.04** (`97.12 / 98.90 / 95.09`) | Ada `sm_89` 733-TFLOPS FP8→FP16 누적 텐서코어(LM 4종 + `lm_head`, `QNT=3`/`shift=32`), 단조 `v2f:0.05` 오더링, `PREFILL_COALESCE=16`, `MAXREQ=160` |
+| v14 | 2.342 s (공식 3회 중앙값) | 97.02 (`96.97 / 98.93 / 95.05`) | Ada `sm_89` 733-TFLOPS FP8→FP16 누적 텐서코어(LM 4종 + `lm_head`, `QNT=3`/`shift=32`), 단조 `v2f:0.05` 오더링, `PREFILL_COALESCE=16`, `MAXREQ=160` (**submission 260: 공식 test `2.451 s / 97.18` 단독 1위**) |
+| v15 | 2.308 s (warm, min 2.286 s) | 97.05 (`97.17 / 98.94 / 95.04`) | ViT FP16-accum 그래프 캡처 캐시 버그 수정, L40S 타일 재튜닝(`lm_head` + 선별적 `_mm_f16`), int32 pinned ring + in-place `pixel_values`, `TRACK2_VIT_HIDE_LAUNCH=1` |
+| v16 | 2.282 s (warm, min 2.266 s) | 97.08 (`97.02 / 99.11 / 95.12`) | **네이티브 CUTLASS 4.4.2 `sm_89` FP8→FP16 EVT GEMM** (`libtrack2_cutlass_f16.so`, `QMMA.16832.F16.E4M3.E4M3`, Stream-K 포함 9개 설정, CUDA Graph 안전, 오차 `0.00066–0.00119`) + ViT 4개 전 투영(`qkv/proj/gate_up/down`) 및 LM 4개 전 투영 적용 |
+| **v17** | **2.268 s (공식 3회 중앙값, min 2.242 s)** | **97.11 combined / 97.17 dev** (`text 97.13 / table 98.86 / formula 95.11`) | v16 + `TRACK2_RECV_HIDE=2` / `TRACK2_RECV_LIMIT=24` (`unwrap_shm_features` 포함, ZMQ 언피클링 갭을 Decode/Extend GPU 대기 뒤로 숨김), `TRACK2_EXTEND_HIDE=1`, `vit_prefetch` 완전 비동기화 (**submission 310**) |
 
 ## 3. v10에 들어간 것
 
@@ -110,7 +112,7 @@ GPU 한 대를 `~/t2gpu.lock`으로 직렬화해서 돌리고 있고, 이 문서
 
 ```bash
 # 박스에서 (track2-base:v1 컨테이너 필요)
-python3 tools/build_kernels.py --gpu cuda            # libtrack2_cuda_sm89.so (nvcc)
+python3 tools/build_kernels.py --gpu cuda            # libtrack2_cuda_sm89.so + libtrack2_cutlass_f16.so + libtrack2_cpu_prep.so
 python3 tools/build_draft_attn.py                    # fi_draft_seedpatch.so / fi_draft_seedarith.so
 python3 tools/build_overlay.py --base /opt/sglang/python --out <team>/gravityocr/sglang/python
 python3 tools/test_fused_kernels.py k2 smq mrope norm   # 커널 비트 검증
@@ -125,25 +127,27 @@ python3 tools/t2log_report.py <team_process_*.log> [--dir <TRACK2_LOG_DIR>]
 
 | 환경 변수 | 기본 | 의미 |
 |---|---|---|
-| `TRACK2_TEXT_PITCH` / `TRACK2_TEXT_MIN_PATCHES` | 32 / 1024 | 텍스트 줄간격 정규화 목표와 적용 최소 패치 수 |
-| `TRACK2_TABLE_MAX_PATCHES` / `TRACK2_TEXT_MAX_PATCHES` | 4096 / 0 | 패치 상한 (0 = 끔) |
-| `TRACK2_DRAFT_SLICE` | 0 | 1 = draft에 16K 어휘 슬라이스 사용 |
-| `TRACK2_DRAFT_KERNEL` | patch | draft 어텐션 모듈 (`patch` / `arith` / `off`) |
-| `TRACK2_FUSED`, `_MLP`, `_MROPE`, `_NORM`, `_NORM_VIT`, `_CHAIN` | 1 | 퓨전 커널 개별 스위치 |
-| `TRACK2_FP8_GEMM_TRITON` | 1 | 비트 동일 Triton GEMM (시작 시 자체 검증, 불일치면 자동 꺼짐) |
-| `TRACK2_FUSED_VERIFY` | 0 | 서버 내부 비트 검증 (진단용) |
-| `TRACK2_GC_FREEZE` | 1 | GC 가드 |
-| `TRACK2_DIRECT_FILE_URL` / `TRACK2_FSYNC_PREDICTIONS` | 1 / 0 | 클라이언트 경로 전달 방식, fsync |
-| `TRACK2_VIT_PF_READY_TARGET` | 0 | ViT 페이싱 (효과 없음, 꺼짐) |
-| `TRACK2_LOG` | 1 | 다층 로그 수준 (2 = 항목별 JSONL, 3 = CUDA 트레이스) |
+| `TRACK2_F16ACC` | `all` | Ada `sm_89` FP8→FP16 누적 텐서코어 적용 범위 (`off` / `lm` / `vit` / `all`) |
+| `TRACK2_CUTLASS_F16` | `1` | 네이티브 CUTLASS 4.4.2 `sm_89` EVT GEMM (`libtrack2_cutlass_f16.so`) 사용 |
+| `TRACK2_VIT_HIDE_LAUNCH` / `TRACK2_EXTEND_HIDE` | `1` / `1` | ViT 커널 런치 및 ZMQ 언피클링을 Decode/Extend GPU 완료 대기 뒤로 숨김 |
+| `TRACK2_RECV_HIDE` / `TRACK2_RECV_LIMIT` | `2` / `24` | GPU 실행 중 ZMQ 수신·`unwrap_shm_features`·요청 처리 숨김 및 메인 루프 버스트 상한 |
+| `TRACK2_TEXT_GLYPH` / `TRACK2_TABLE_GLYPH` / `TRACK2_TEXT_GLYPH_UP` | `12` / `12` / `12` | 글자 본체 높이 정규화(축소 + 소형 텍스트 업스케일) |
+| `TRACK2_MARGIN_CROP` / `TRACK2_MARGIN_TASKS` | `1` / `text,table,formula` | 여백 자동 절단 + 28 px 그리드 스냅 |
+| `TRACK2_ORDER` / `TRACK2_TEXT_BOOST` | `v2f:0.05` / `1.0` | 단조 2-특징 LPT 요청 오더링 |
+| `TRACK2_FP8_LM_HEAD` / `TRACK2_FP8_LM_HEAD_F16` | `both` / `1` | Fused FP8 `lm_head` + 블록 argmax (FP16 누적) |
+| `TRACK2_FUSED_MROPE_KV` / `TRACK2_KV_NOSPLIT` / `TRACK2_ATTN_NOFILL` | `1` / `1` / `1` | M-RoPE+KV 스캐터 퓨전, FlashInfer KV no-split, uninitialized output |
+| `TRACK2_DRAFT_KERNEL` | `patch` | draft 어텐션 모듈 (`patch` / `arith` / `off`) |
+| `TRACK2_GC_FREEZE` | `1` | GC 가드 |
+| `TRACK2_LOG` | `1` | 다층 로그 수준 (2 = 항목별 JSONL, 3 = CUDA 트레이스) |
 
 ## 10. 박스에 있는 것
 
 | 경로 | 내용 |
 |---|---|
-| `~/teams/v10` | 최신 후보 |
-| `~/teams/v9a`, `~/submission_v9a.zip` | 제출본 208 |
-| `~/my-team` | 패키징 대상 (v10 패키징이 끝나면 v10과 동일) |
+| `~/teams/v17`, `~/submission_v17.zip` | 최신 제출본 (**submission 310**, 공식 `local_run.py` `2.268 s / combined 97.11 / dev 97.17`) |
+| `~/teams/v14`, `~/submission_v14.zip` | 라이브 1위 확정 제출본 (**submission 260**, 공식 test `2.451 s / 97.18`) |
+| `~/teams/v9a`, `~/submission_v9a.zip` | 이전 제출본 (submission 208, test `3.416 s / 97.21`) |
+| `~/my-team` | 패키징 대상 (`~/teams/v17`과 동일) |
 | `~/my-team-v3` | 세션 시작 시점 백업 |
-| `~/eval_dev_v7`, `v8`, `v9a`, `v10` | 공식 하네스 결과 |
+| `~/eval_dev_v14`, `~/eval_dev_v17`, `~/eval_ex_v17` | 공식 하네스 검증 결과 |
 | `~/scen-out`, `~/warm-out`, `~/scores` | 시나리오·warm 측정과 채점 결과 |

@@ -176,6 +176,38 @@ def build_cuda_sm89(env: dict) -> Path | None:
     return out
 
 
+def build_cutlass_f16(env: dict) -> Path | None:
+    """libtrack2_cutlass_f16.so: CUTLASS 4.4.2 Ada sm_89 FP8xFP8->FP16-accum EVT GEMM (733-TFLOPS QMMA.16832.F16)."""
+    src = ROOT / "rust_gpu" / "kernels" / "track2_cutlass_f16.cu"
+    if not src.is_file():
+        return None
+    root = cuda_root()
+    nvcc = str(root / "bin" / "nvcc") if root and (root / "bin" / "nvcc").exists() else shutil.which("nvcc")
+    if not nvcc:
+        print("  warning: nvcc not found; libtrack2_cutlass_f16.so not built")
+        return None
+    cut_cands = [
+        env.get("CUTLASS_INCLUDE", ""),
+        "/opt/sglang/.venv-sglang/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
+        "/opt/sglang/.venv-sglang/lib/python3.12/site-packages/deep_gemm/include",
+    ]
+    cut_inc = next((Path(p) for p in cut_cands if p and (Path(p) / "cutlass" / "cutlass.h").is_file()), None)
+    if cut_inc is None:
+        print("  warning: CUTLASS headers not found; libtrack2_cutlass_f16.so not built")
+        return None
+    out = OUT / "libtrack2_cutlass_f16.so"
+    cmd = [
+        nvcc, "-O3", "-std=c++17", f"-arch=sm_{env.get('CUDA_COMPUTE_CAP', '89')}",
+        "--expt-relaxed-constexpr", "--shared", "-Xcompiler", "-fPIC",
+        f"-I{cut_inc}", f"-I{cut_inc.parent / 'tools' / 'util' / 'include'}",
+        "-o", str(out), str(src),
+    ]
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True, env=env)
+    print(f"  -> {out}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", default="auto", help="auto | none | comma list of rocm, vulkan, cuda")
@@ -192,6 +224,7 @@ def main() -> None:
     if args.gpu != "none" and ("cuda" in [f.strip() for f in args.gpu.split(",")]
                                or (args.gpu == "auto" and cuda_root() is not None)):
         build_cuda_sm89(env)
+        build_cutlass_f16(env)
     if sys.platform != "win32":
         build_cpu_prep(env)
     if args.gpu != "none" and have_cargo:

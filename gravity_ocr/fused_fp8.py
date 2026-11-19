@@ -204,7 +204,8 @@ def _install_norm(C) -> int:
                     use_f16 = True
                     if not getattr(L, "_t2_f16_logged", False):
                         L._t2_f16_logged = True
-                        print("[track2-f16acc] LM ON (QNT=3, shift=32, mma.f16.e4m3)", flush=True)
+                        _be = "cutlass_f16+triton" if getattr(_G, "_CUTLASS_F16", None) and _G._CUTLASS_F16.available() else "triton"
+                        print(f"[track2-f16acc] LM ON (QNT=3, shift=32, {_be})", flush=True)
                 else:
                     use_f16 = False
                 self._t2_f16_lm = use_f16
@@ -286,6 +287,25 @@ def _install_norm(C) -> int:
                 if getattr(self, "_t2_first", False):  # first block of a forward: drop a stale step
                     pend = None
             at, mlp = self.attn, self.mlp
+            # Rescale all 4 ViT block projections (qkv, proj, gate_up, down) once on the first non-capturing call
+            # so CUDA graph capture and packed eager batches both run Ada sm_89 FP16-accum GEMMs!
+            if (_F16_VIT and not getattr(self, "_t2_f16_vit", False)
+                    and not torch.cuda.is_current_stream_capturing()
+                    and _down_ok(at.qkv_proj) and _down_ok(mlp.gate_up_proj) and _down_ok(mlp.down_proj)):
+                _G.rescale_f16_weight(at.qkv_proj)
+                _G.rescale_f16_weight(mlp.gate_up_proj)
+                _G.rescale_f16_weight(mlp.down_proj)
+                _proj_ok = _down_ok(at.proj)
+                if _proj_ok:
+                    _G.rescale_f16_weight(at.proj)
+                    at._t2_f16_proj = True
+                    at._t2_cuda_mod = C
+                    at._t2_f16_mm = _G.mm_f16
+                self._t2_f16_vit = True
+                if not getattr(B, "_t2_f16_logged", False):
+                    B._t2_f16_logged = True
+                    _be = "cutlass_f16+triton" if getattr(_G, "_CUTLASS_F16", None) and _G._CUTLASS_F16.available() else "triton"
+                    print(f"[track2-f16acc] ViT ON (qkv+{'proj+' if _proj_ok else ''}gate_up+down: QNT=3, shift=32, {_be})", flush=True)
             if (x.dim() != 3 or x.shape[1] != 1 or x.shape[0] == 0 or x.dtype != torch.bfloat16
                     or x.shape[-1] not in (1024, 1536) or not x.is_contiguous()
                     or (pend is not None and (pend.shape != x.shape or not pend.is_contiguous()))
@@ -294,19 +314,9 @@ def _install_norm(C) -> int:
                 if pend is not None:
                     x = x + pend  # the previous block's `x_after_add + mlp_out`, as SGLang runs it
                 return orig_b(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
-            use_f16 = getattr(self, "_t2_f16_vit", None)
-            if use_f16 is None:
-                if _F16_VIT and not torch.cuda.is_current_stream_capturing():
-                    _G.rescale_f16_weight(at.qkv_proj)
-                    _G.rescale_f16_weight(mlp.gate_up_proj)
-                    use_f16 = True
-                    if not getattr(B, "_t2_f16_logged", False):
-                        B._t2_f16_logged = True
-                        print("[track2-f16acc] ViT ON (qkv + gate_up: QNT=3, shift=32, mma.f16.e4m3)", flush=True)
-                else:
-                    use_f16 = False
-                self._t2_f16_vit = use_f16
+            use_f16 = getattr(self, "_t2_f16_vit", False)
             nq_div = (C.NORM_DIV | 2) if use_f16 else None
+            smq_qnt = 3 if use_f16 else None
             lin_fn = lin_f16 if use_f16 else lin
             S, _, H = x.shape
             x2d = x.view(S, H)
@@ -330,8 +340,8 @@ def _install_norm(C) -> int:
             q8, s = C.norm_quant_fp8(x2d, self.norm2.weight, self.norm2.variance_epsilon, residual=attn2d,
                                      mode=C.NORM_MODE_ADD, div=nq_div)
             gate_up = lin_fn(mlp.gate_up_proj, q8, s, x.dtype)
-            q8, s = C.silu_mul_quant_fp8(gate_up)
-            mlp_out = lin(mlp.down_proj, q8, s, x.dtype)
+            q8, s = C.silu_mul_quant_fp8(gate_up, qnt_mode=smq_qnt)
+            mlp_out = lin_fn(mlp.down_proj, q8, s, x.dtype)
             if st is not None and _CHAIN and not getattr(self, "_t2_last", True):
                 st.pending = mlp_out.view(S, 1, H)  # added inside the next block's norm1 kernel
                 return attn2d.view(S, 1, H)
