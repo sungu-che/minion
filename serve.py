@@ -65,6 +65,10 @@ if USE_SHM_IPC:
         USE_SHM_IPC = False
 
 IPC_MODE = "shm_symlink" if USE_SHM_IPC else "png_b64"
+# file:// straight to the job folder when the path is plain ASCII (no symlink syscalls); 0 = always symlink into /dev/shm
+DIRECT_FILE_URL = os.environ.get("TRACK2_DIRECT_FILE_URL", "1") == "1"
+# fsync of predictions.jsonl before DONE: not needed for other processes to read the file
+FSYNC_PREDICTIONS = os.environ.get("TRACK2_FSYNC_PREDICTIONS", "0") == "1"
 _JOB_NO = 0
 
 TASK_PROMPTS = {
@@ -137,7 +141,7 @@ def start_server() -> subprocess.Popen:
         "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         "TRACK2_STAGE": str(STAGE),
         "TRACK2_RESCUE": os.environ.get("TRACK2_RESCUE", "1"),
-        "TRACK2_SLICE_DIR": str(HERE / "vocab_slices"),
+        "TRACK2_SLICE_DIR": os.environ.get("TRACK2_SLICE_DIR", str(HERE / "vocab_slices")),
     })
 
     py_paths: list[str] = []
@@ -363,7 +367,29 @@ def cleanup_shm() -> None:
             pass
 
 
+_PLAIN_PATH = re.compile(r"^[A-Za-z0-9_./\\-]+$")
+
+
+def image_size_fast(path: str) -> tuple[int, int]:
+    """(width, height) from the first bytes of a PNG / GIF / BMP file; (0, 0) when the format needs a real parser."""
+    try:
+        with open(path, "rb") as f:
+            b = f.read(32)
+    except OSError:
+        return 0, 0
+    if len(b) >= 24 and b[:8] == b"\x89PNG\r\n\x1a\n" and b[12:16] == b"IHDR":
+        return int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big")
+    if len(b) >= 10 and b[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(b[6:8], "little"), int.from_bytes(b[8:10], "little")
+    if len(b) >= 26 and b[:2] == b"BM":
+        return int.from_bytes(b[18:22], "little", signed=True), abs(int.from_bytes(b[22:26], "little", signed=True))
+    return 0, 0
+
+
 def build_image_url(img_path: Path, idx: int, mode: str) -> str:
+    if mode == "shm_symlink" and DIRECT_FILE_URL and _PLAIN_PATH.match(str(img_path)):
+        # the symlink only gave the server a path it can open: a plain absolute path is that already
+        return f"file://{img_path}"
     if mode == "shm_symlink":
         ext = img_path.suffix.lower() or ".png"
         link = SHM_DIR / f"c_{idx}{ext}"
@@ -387,25 +413,37 @@ def build_image_url(img_path: Path, idx: int, mode: str) -> str:
 
 def prepare_job_items(items: list[dict[str, Any]], folder: Path, mode: str) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
+    root = folder.resolve()  # once: the per-item resolve() was a syscall chain per crop
     for idx, item in enumerate(items):
         cid = item["id"]
         task_key = detect_task(item)
         prompt_str = item.get("prompt") or TASK_PROMPTS[task_key]
-        img_path = (folder / item["image"]).resolve()
+        img_path = root / item["image"]
         area = 0
+        nbytes = 0
+        w = h = 0
         if STAGE >= 1:
             try:
-                with Image.open(img_path) as im:
-                    w, h = im.size  # header-only, no pixel decode
-                area = w * h
-            except Exception:
-                area = img_path.stat().st_size if img_path.exists() else 0
+                nbytes = os.stat(img_path).st_size
+            except OSError:
+                nbytes = 0
+            w, h = image_size_fast(str(img_path))
+            if not w or not h:
+                try:
+                    with Image.open(img_path) as im:
+                        w, h = im.size  # header-only, no pixel decode
+                except Exception:
+                    w = h = 0
+            area = w * h if w and h else nbytes
         image_url = build_image_url(img_path, idx, mode)
         prepared.append({
             "id": cid,
             "task_key": task_key,
             "bucket_rank": TASK_BUCKET_ORDER[task_key],
             "area": area,
+            "bytes": nbytes,
+            "w": w,
+            "h": h,
             "prompt": prompt_str,
             "image_url": image_url,
         })
@@ -448,6 +486,18 @@ async def probe_ipc_mode_async(pool: AsyncKeepAlivePool, sample_item: dict[str, 
             log(f"IPC probe {mode} rejected ({e}); trying fallback...")
             cleanup_shm()
     return "png_b64"
+
+
+_AFTER_DONE: list = []   # work deferred until the job's DONE marker exists (shm cleanup, logs)
+
+
+def run_after_done() -> None:
+    while _AFTER_DONE:
+        fn = _AFTER_DONE.pop(0)
+        try:
+            fn()
+        except Exception as e:  # logging / cleanup must never break the serving loop
+            log(f"post-job step failed: {e}")
 
 
 async def run_manifest_async(
@@ -506,14 +556,18 @@ async def run_manifest_async(
         except OSError:
             pass
 
-    cleanup_shm()
-    log(
-        f"manifest {folder.name}: {len(items)} crops in {t_infer - t0:.3f}s "
-        f"(prep={t_prep - t0:.3f}s, infer={t_infer - t_prep:.3f}s, ipc={IPC_MODE}, async_conns={pool.max_conns})"
-    )
-    if _t2log is not None:
-        _log_client_job(folder.name, scheduled, results_map, t0, t_prep, t_infer, t_send, t_done,
-                        pool.n_retry - retry0, pool.n_fail - fail0)
+    retries, fails = pool.n_retry - retry0, pool.n_fail - fail0
+
+    def _finish() -> None:
+        cleanup_shm()
+        log(
+            f"manifest {folder.name}: {len(items)} crops in {t_infer - t0:.3f}s "
+            f"(prep={t_prep - t0:.3f}s, infer={t_infer - t_prep:.3f}s, ipc={IPC_MODE}, async_conns={pool.max_conns})"
+        )
+        if _t2log is not None:
+            _log_client_job(folder.name, scheduled, results_map, t0, t_prep, t_infer, t_send, t_done, retries, fails)
+
+    _AFTER_DONE.append(_finish)
     return [(m["id"], results_map.get(m["id"], "")) for m in items]
 
 
@@ -560,6 +614,7 @@ async def warmup_async(pool: AsyncKeepAlivePool) -> None:
     await pool.prewarm(512)
     # Warm ALL dev crops (untimed!) so every Triton/FlashInfer/ViT shape is JIT-compiled before READY
     await run_manifest_async(dev_dir, pool, limit=None)
+    run_after_done()
     log(f"untimed full warmup ({len(items)} dev crops) finished in {time.monotonic() - t0:.1f}s")
 
 
@@ -567,6 +622,11 @@ async def async_main() -> None:
     pool = AsyncKeepAlivePool("127.0.0.1", PORT, CLIENT_CONC)
     try:
         await warmup_async(pool)
+        try:
+            from gravity_ocr import gcguard as _gcguard
+            _gcguard.freeze("client")
+        except Exception as e:
+            log(f"gc guard not applied: {e}")
         Path(WORK, "READY").touch()
         log("READY signaled; polling jobs...")
 
@@ -591,10 +651,13 @@ async def async_main() -> None:
                     with open(pred_path, "w", encoding="utf-8") as f:
                         if out_lines:
                             f.write("\n".join(out_lines) + "\n")
-                        f.flush()
-                        os.fsync(f.fileno())
+                        if FSYNC_PREDICTIONS:
+                            f.flush()
+                            os.fsync(f.fileno())
+                    # closed file: its content is visible to every reader; DONE is what stops the harness clock
                     (job_dir / "DONE").touch()
                     seen.add(name)
+                    run_after_done()
             await asyncio.sleep(0.0005)
     finally:
         await pool.close_all()

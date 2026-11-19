@@ -164,6 +164,20 @@ class _SchedLayer:
         self._summary()
         self.reset()
 
+    def _ahead_delta(self) -> Dict[str, Any]:
+        """Self-spec draft-ahead counters of this job (the worker's _ahead_stats): launched / used / discarded, and why a
+        round ran without a pre-launched draft (skip_sched: a prefill admission was due; no_precheck: a request could finish)."""
+        try:
+            dw = getattr(getattr(self, "sched", None), "draft_worker", None)
+            cur = dict(getattr(dw, "_ahead_stats", None) or {})
+            if not cur:
+                return {}
+            prev = getattr(self, "_ahead_prev", None) or {}
+            self._ahead_prev = cur
+            return {"draft_ahead": {k: int(v) - int(prev.get(k, 0)) for k, v in cur.items() if k != "freed_slots"}}
+        except Exception:
+            return {}
+
     def _trace_start(self) -> None:
         try:
             import torch
@@ -221,6 +235,7 @@ class _SchedLayer:
             "finished": sum(r.get("fin", 0) for r in dec) + sum(r.get("fin", 0) for r in ext),
             **({"commit_hist": dict(sorted(self.commit_hist.items()))} if self.commit_hist else {}),
             **({"cuda_alloc": alloc} if alloc else {}),
+            **self._ahead_delta(),
         })
         # L4: resolve the batch GPU times (events of finished batches; no synchronization)
         if self.vit_batches:
@@ -267,6 +282,7 @@ def install_scheduler() -> None:
     def run_batch(self, batch, *a, **k):
         st = {"t0": now(), "mode": batch.forward_mode.name, "bs": batch.batch_size(), "wq": len(self.waiting_queue),
               "run": len(self.running_batch.reqs) if self.running_batch is not None else 0}
+        SCHED.sched = self
         try:
             if batch.forward_mode.is_extend():
                 st["ext_tok"] = int(sum(getattr(r, "extend_input_len", 0) or 0 for r in batch.reqs))

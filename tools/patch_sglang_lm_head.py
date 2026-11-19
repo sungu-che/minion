@@ -64,10 +64,13 @@ def _t2_get_lm_head_cache(lm_head, vocab_size: int):
     else:
         W_pad = W[:v_full].contiguous()
 
-    # Load universal 16,384-row core slice if available
+    # Draft rows: full vocabulary by default. A 16,384-id slice (TRACK2_DRAFT_SLICE=1) makes the draft GEMM 3.6x smaller,
+    # but 1.9% of the dev output tokens (10% for non-Korean text) lie outside it and every such token ends the round's
+    # accepted run: measured 15.3 tokens per request-round with the slice vs about 20 without, i.e. -0.19 s per job.
+    # The verify always uses the full vocabulary, so outputs do not depend on this switch.
     W_core = None
     core_ids = None
-    slice_dir = _t2_os.environ.get("TRACK2_SLICE_DIR", "")
+    slice_dir = _t2_os.environ.get("TRACK2_SLICE_DIR", "") if _t2_os.environ.get("TRACK2_DRAFT_SLICE", "0") == "1" else ""
     cand_paths = [
         _t2_os.path.join(slice_dir, "universal_16k_ids.npy") if slice_dir else "",
         _t2_os.path.join(slice_dir, "core_table_ids.npy") if slice_dir else "",

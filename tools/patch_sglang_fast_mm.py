@@ -92,6 +92,7 @@ _SHM_NP: Optional[np.ndarray] = None
 _SHM_OFFSET = 0
 
 
+_T2_GC_DONE = False
 _T2_CAP_TEXT = int(os.environ.get("TRACK2_TEXT_MAX_PATCHES", "0"))    # 0 = off
 _T2_CAP_TABLE = int(os.environ.get("TRACK2_TABLE_MAX_PATCHES", "0"))  # 0 = off
 
@@ -200,6 +201,14 @@ def _fast_prepare_shm_or_bf16(
 ) -> Optional[Tuple[torch.Tensor, Tuple[int, int]]]:
     if _g_preprocess is None:
         return None
+    global _T2_GC_DONE
+    if not _T2_GC_DONE:
+        _T2_GC_DONE = True  # [TRACK2-GC] tokenizer manager: startup is over, keep cyclic-GC pauses out of the jobs
+        try:
+            from gravity_ocr import gcguard as _t2_gcguard
+            _t2_gcguard.freeze("tokenizer")
+        except Exception:
+            pass
     _t2_t0 = time.perf_counter()
     chw = _decode_raw_chw_u8(item)
     if chw is None:

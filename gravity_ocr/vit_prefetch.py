@@ -35,6 +35,10 @@ BATCH_IMAGES = int(os.environ.get("TRACK2_VIT_PF_IMAGES", "64"))
 # blocks the scheduler thread (and every decode launch) until the GPU drains it.
 MAX_INFLIGHT = int(os.environ.get("TRACK2_VIT_PF_INFLIGHT", "2"))
 RANK_ORDER = os.environ.get("TRACK2_RANK_ORDER", "1") == "1"
+# Pacing (0 = off): while the LM is decoding and at least this many waiting requests already have their image encoded
+# (or in flight), no new ViT batch is launched. The ViT then stays just ahead of the LM's admissions instead of racing
+# to the end of the queue, so its kernels are left to fill the LM's host-bound gaps late in the job as well.
+READY_TARGET = int(os.environ.get("TRACK2_VIT_PF_READY_TARGET", "0"))
 SCHED_PRIORITY = int(os.environ.get("TRACK2_SCHED_STREAM_PRIORITY", "-10"))
 
 _PF: Optional["VitPrefetcher"] = None
@@ -93,6 +97,8 @@ class VitPrefetcher:
         self.n_ondemand = 0
         self.n_patches = 0
         self.t_launch = 0.0
+        self.n_paced = 0  # ticks on which the ready-pool target held a launch back
+        self.gc_done = False
 
     # ------------------------------------------------------------------ submission (scheduler thread)
     def submit_reqs(self, reqs) -> None:
@@ -116,10 +122,13 @@ class VitPrefetcher:
             # encode in the client's rank order, not in the order the tokenizer manager happened to finish requests
             self.pending = collections.deque(sorted(self.pending, key=lambda it: it._t2_rank))
 
-    def pump(self) -> None:
-        """Keep up to MAX_INFLIGHT packed batches queued on the ViT stream (non-blocking: completion is polled)."""
+    def reap(self) -> None:
         while self.inflight and self.inflight[0].query():
             self.inflight.popleft()
+
+    def pump(self) -> None:
+        """Keep up to MAX_INFLIGHT packed batches queued on the ViT stream (non-blocking: completion is polled)."""
+        self.reap()
         while self.pending and len(self.inflight) < MAX_INFLIGHT:
             batch, patches = [], 0
             while self.pending and len(batch) < BATCH_IMAGES:
@@ -227,6 +236,15 @@ def wait_first(req) -> None:
             it._t2_ev.synchronize()
 
 
+def launched(req) -> bool:
+    """True when every descriptor image of the request has been launched on the ViT stream (done or in flight)."""
+    mm = getattr(req, "multimodal_inputs", None)
+    items = getattr(mm, "mm_items", None) if mm is not None else None
+    if not items:
+        return True
+    return all(getattr(it, "_t2_state", 0) in (0, 2) for it in items)
+
+
 def register(pf: VitPrefetcher) -> None:
     global _PF
     _PF = pf
@@ -246,13 +264,25 @@ def tick(sched) -> None:
     t0 = time.perf_counter() if _TRACE else 0.0
     wq = getattr(sched, "waiting_queue", None)
     n0 = pf.n_items
+    if wq and not pf.gc_done:
+        pf.gc_done = True  # startup (load, graph capture) is over: no cyclic-GC pauses inside jobs from here on
+        try:
+            from gravity_ocr import gcguard
+            gcguard.freeze("scheduler")
+        except Exception as e:
+            pf.log(f"[track2-gc] scheduler: not applied ({e})")
     if wq:
         if RANK_ORDER and len(wq) > 1:
             # admission follows the client's rank (FCFS without priority scheduling never reorders the queue itself)
             wq.sort(key=req_rank)
         pf.submit_reqs(wq)
     if pf.pending:
-        pf.pump()
+        if (READY_TARGET > 0 and wq and sched.running_batch.reqs
+                and sum(1 for r in wq if launched(r)) >= READY_TARGET):
+            pf.reap()
+            pf.n_paced += 1  # enough encoded requests are waiting for LM slots: leave the GPU to the decode for now
+        else:
+            pf.pump()
     t1 = time.perf_counter() if _TRACE else 0.0
     waited = False
     if wq and sched.chunked_req is None and not sched.running_batch.reqs and not ready(wq[0]):

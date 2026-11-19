@@ -28,7 +28,11 @@ export TRACK2_SHM_GPU_MM="${TRACK2_SHM_GPU_MM:-1}"
 export TRACK2_FOLD_PATCH_EMBED="${TRACK2_FOLD_PATCH_EMBED:-1}"
 export TRACK2_MM_WORKERS="${TRACK2_MM_WORKERS:-4}"
 export TRACK2_TEXT_DOWNSCALE="${TRACK2_TEXT_DOWNSCALE:-1}"
-export TRACK2_TEXT_PITCH="${TRACK2_TEXT_PITCH:-64}"
+# v9a size policy (submission 208): text scaled to a 32 px line pitch (the median native pitch of dev text crops) for crops of
+# 1024+ patches; tables capped at 4096 patches; formulas are never resized
+export TRACK2_TEXT_PITCH="${TRACK2_TEXT_PITCH:-32}"
+export TRACK2_TEXT_MIN_PATCHES="${TRACK2_TEXT_MIN_PATCHES:-1024}"
+export TRACK2_TABLE_MAX_PATCHES="${TRACK2_TABLE_MAX_PATCHES:-4096}"
 export TRACK2_VIS_QKV_CUDA="${TRACK2_VIS_QKV_CUDA:-1}"
 export TRACK2_FAST_LM_HEAD="${TRACK2_FAST_LM_HEAD:-1}"
 export SGLANG_MM_SKIP_COMPUTE_HASH="${SGLANG_MM_SKIP_COMPUTE_HASH:-1}"
