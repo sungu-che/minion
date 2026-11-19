@@ -66,11 +66,17 @@ def main() -> None:
             shutil.rmtree(dst)
         shutil.copytree(src, dst, ignore=ignore_junk)
 
-    # Ensure Linux LF and +x on shell scripts
+    # Ensure Linux LF, +x on shell scripts, and strip world/group write bits (harness empties world-writable dirs)
     for sh in out.rglob("*.sh"):
         normalize_lf(sh)
         if os.name != "nt":
-            sh.chmod(sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            sh.chmod((sh.stat().st_mode & ~0o022) | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if os.name != "nt":
+        for p in [out, *out.rglob("*")]:
+            try:
+                p.chmod(p.stat().st_mode & ~0o022)
+            except OSError:
+                pass
 
     assert (out / "team.yaml").is_file() and (out / "serve.py").is_file()
     print(f"Assembled clean Track 2 team folder at: {out}", flush=True)

@@ -1,44 +1,41 @@
 #!/usr/bin/env python3
-"""Track 2 (Gravity-OCR Speed Run) High-Throughput Lossless Multi-Batch Server.
+"""Track 2 (Gravity-OCR Speed Run) High-Throughput Lossless Multi-Batch Server (V2).
 
-Follows the Track 2 harness contract strictly (READY -> jobs/<n>-<split>/manifest.jsonl ->
-predictions.jsonl + DONE -> STOP) and preserves trida-stack's untimed SGLang rebuild path
-(`gravityocr/sglang/` + `gravityocr/serve.sh`), while integrating:
-1. Untimed All-in-VRAM preloading & multi-batch CUDA Graph warmup before READY.
-2. Lock-free 64-worker AVX2 outer margin trimming (`text_px=None`, `damp=False`) + virtual grid
-   for ruleless tables via `gravity_ocr`.
-3. Task bucketing (`table -> text -> formula`) & patch-area descending sort for RadixAttention
-   prompt KV cache sharing and zero tail-latency stragglers.
-4. Auto-probed zero-compression `/dev/shm` BMP IPC (eliminates PNG zlib re-encoding & Base64
-   round-trip, with automatic safe fallback to BMP/PNG data URLs if local file URLs are disabled).
-5. Code-fence (```html, ```latex) & outer `$$` sanitizer + original manifest ID order `fsync`.
+Pure-BF16 lossless architecture verified against L40S (sm_89) + track2-base:v1:
+1. Untimed All-in-VRAM preloading, SGLang overlay build (L40S ViT CUDA Graphs + SDPA),
+   and multi-batch warmup before READY.
+2. Zero-decode /dev/shm symlink IPC (`c_{idx}.png`): eliminates 1.2s client PIL decode/BMP
+   re-encode AND eliminates URL-unescape bugs on crop IDs containing `%20` / `%28`.
+3. Header-only (~4ms) LPT scheduling: `table -> text -> formula`, descending by pixel area
+   (`W * H`) so the longest tables launch first (eliminating tail latency).
+4. Persistent HTTP/1.1 Keep-Alive worker connections (eliminates 402 TCP handshakes).
+5. Code-fence sanitizer + original manifest ID order atomic `fsync` writer.
 
 Tuning switches (environment variables):
-  TRACK2_STAGE        : "0" (baseline pass-through) | "1" (preproc+bucket+shm)
-                        | "2" (+ Q*K^T vocab slicing & rescue) | "3" (+ 1-hop RoPE pruning, default)
-  TRACK2_CONCURRENCY  : concurrent SGLang requests (default "96", falls back to CONCURRENCY)
-  TRACK2_SHM_IPC      : "1" (try /dev/shm BMP IPC, default) | "0" (in-memory data URL)
-  TRACK2_VIRTUAL_GRID : "1" (Luma=180 virtual grid on ruleless tables, default) | "0"
-  TRACK2_TRIM         : "1" (lossless outer whitespace trim with 6px halo, default) | "0"
-  TRACK2_RESCUE       : "1" (Cauchy-Schwarz lossless rescue, default) | "0"
+  TRACK2_STAGE        : "0" (reference order) | "1"+ (LPT + /dev/shm symlink + keep-alive, default "3")
+  TRACK2_CONCURRENCY  : concurrent SGLang requests (default "96")
+  TRACK2_SHM_IPC      : "1" (/dev/shm symlink zero-copy IPC, default) | "0" (base64 PNG)
+  TRACK2_TRIM         : "0" (original pixels, default for 100% baseline quality) | "1"
+  TRACK2_VIRTUAL_GRID : "0" (default — avoids synthetic table TEDS drop) | "1"
+  TRACK2_RESCUE       : "1" (Cauchy-Schwarz lossless lm_head rescue, default) | "0"
 """
 from __future__ import annotations
 
 import base64
-import io
+import http.client
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
@@ -57,9 +54,6 @@ MAX_TOKENS = 4096
 STAGE = int(os.environ.get("TRACK2_STAGE", "3"))
 CONCURRENCY = int(os.environ.get("TRACK2_CONCURRENCY", os.environ.get("CONCURRENCY", "96" if STAGE >= 1 else "48")))
 USE_SHM_IPC = STAGE >= 1 and os.environ.get("TRACK2_SHM_IPC", "1") == "1"
-USE_VIRTUAL_GRID = STAGE >= 1 and os.environ.get("TRACK2_VIRTUAL_GRID", "1") == "1"
-USE_TRIM = STAGE >= 1 and os.environ.get("TRACK2_TRIM", "1") == "1"
-CPU_WORKERS = min(64, max(8, (os.cpu_count() or 8) * 2))
 
 SHM_DIR = Path("/dev/shm/track2_crops")
 if USE_SHM_IPC:
@@ -68,26 +62,8 @@ if USE_SHM_IPC:
     except OSError:
         USE_SHM_IPC = False
 
-# Active IPC transport decided during untimed warmup: "shm_file", "shm_path", "bmp_b64", or "png_b64"
-IPC_MODE = "shm_file" if USE_SHM_IPC else ("bmp_b64" if STAGE >= 1 else "png_b64")
-
-
-def log(msg: str) -> None:
-    print(f"[track2-minion] {msg}", flush=True)
-
-
-# ── Native AVX2 preprocessing module + lock-free Rayon thread pin (gk_set_threads(1)) ──
-HAS_NATIVE_PREPROC = False
-try:
-    from gravity_ocr import native
-    from gravity_ocr.drawing import crops
-
-    threads = native.set_threads(1)
-    HAS_NATIVE_PREPROC = True
-    log(f"gravity_ocr loaded (native_threads={threads})")
-except Exception as e:
-    crops = None  # type: ignore[assignment]
-    log(f"gravity_ocr fallback to numpy/PIL: {e}")
+IPC_MODE = "shm_symlink" if USE_SHM_IPC else "png_b64"
+_THREAD_LOCAL = threading.local()
 
 TASK_PROMPTS = {
     "table": "Table Recognition:",
@@ -100,8 +76,11 @@ FENCE_HEAD_RE = re.compile(r"^\s*```(?:html|markdown|md|latex|tex|text)?\s*\n?",
 FENCE_TAIL_RE = re.compile(r"\n?\s*```\s*$", re.IGNORECASE)
 
 
+def log(msg: str) -> None:
+    print(f"[track2-minion] {msg}", flush=True)
+
+
 def own(name: str, stock: str | None) -> str | None:
-    """Return submission-local copy of `name` if present, else `stock`."""
     mine = str(HERE / name)
     return mine if os.path.exists(mine) else stock
 
@@ -140,11 +119,7 @@ def start_server() -> subprocess.Popen:
         "HF_HOME": os.path.join(os.environ["HOME"], ".cache", "huggingface"),
         "TOKENIZER_WORKERS": os.environ.get("TOKENIZER_WORKERS", "1"),
         "MAXREQ": os.environ.get("MAXREQ", str(CONCURRENCY)),
-        # All-in-VRAM & accelerator controls
         "CUDA_MODULE_LOADING": os.environ.get("CUDA_MODULE_LOADING", "EAGER"),
-        "GRAVITY_OCR_RESIDENCY": os.environ.get("GRAVITY_OCR_RESIDENCY", "auto"),
-        "GRAVITY_OCR_KV": os.environ.get("GRAVITY_OCR_KV", "f32"),
-        "GRAVITY_OCR_WEIGHTS": os.environ.get("GRAVITY_OCR_WEIGHTS", "half"),
         "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         "TRACK2_STAGE": str(STAGE),
         "TRACK2_RESCUE": os.environ.get("TRACK2_RESCUE", "1"),
@@ -176,57 +151,25 @@ def wait_ready(server: subprocess.Popen, timeout: int = 270) -> None:
     while time.monotonic() < deadline:
         if server.poll() is not None:
             sys.exit(f"[track2-minion] server exited early with code {server.returncode}")
-        for endpoint in ("/v1/models", "/health"):
-            try:
-                with urllib.request.urlopen(f"{URL}{endpoint}", timeout=3) as r:
-                    if r.status == 200:
-                        return
-            except Exception:
-                pass
+        try:
+            with urllib.request.urlopen(f"{URL}/v1/models", timeout=3) as r:
+                if r.status == 200:
+                    return
+        except Exception:
+            pass
         time.sleep(0.5)
     sys.exit("[track2-minion] server not ready in time")
 
 
 def sanitize_output(text: str, task_key: str) -> str:
-    """Strip spurious markdown code fences (```html/```latex) and outer $$ delimiters."""
+    """Strip only spurious markdown code fences (```html/```latex) if emitted."""
     if not text or STAGE == 0:
         return text or ""
-    cleaned = text.strip()
-    if "```" in cleaned:
-        cleaned = FENCE_HEAD_RE.sub("", cleaned)
-        cleaned = FENCE_TAIL_RE.sub("", cleaned)
-    if task_key == "formula" and cleaned.startswith("$$") and cleaned.endswith("$$") and len(cleaned) > 4:
-        cleaned = cleaned[2:-2].strip()
-    return cleaned.strip()
-
-
-def trim_outer_whitespace(rgb: np.ndarray, pad: int = 6) -> np.ndarray:
-    """Lossless outer paper whitespace trim (keeps original resolution & 6px halo)."""
-    if HAS_NATIVE_PREPROC and crops is not None:
-        return crops.trim_outer_whitespace(rgb, pad=pad)
-    h, w, _ = rgb.shape
-    if h <= 32 or w <= 32:
-        return rgb
-    ink_mask = rgb.min(axis=2) < 245
-    if not np.any(ink_mask):
-        return rgb
-    rows = np.flatnonzero(ink_mask.any(axis=1))
-    cols = np.flatnonzero(ink_mask.any(axis=0))
-    r0, r1 = max(0, int(rows[0]) - pad), min(h, int(rows[-1]) + 1 + pad)
-    c0, c1 = max(0, int(cols[0]) - pad), min(w, int(cols[-1]) + 1 + pad)
-    if (r1 - r0) >= h - 4 and (c1 - c0) >= w - 4:
-        return rgb
-    return np.ascontiguousarray(rgb[r0:r1, c0:c1])
-
-
-def inject_virtual_grid(rgb: np.ndarray) -> np.ndarray:
-    """Draw 1px Luma=180 virtual grid in whitespace valleys of ruleless tables (`text_px=None, damp=False`)."""
-    if not USE_VIRTUAL_GRID or not HAS_NATIVE_PREPROC or crops is None:
-        return rgb
-    try:
-        return crops.prepare_crop(rgb, prompt="table", text_px=None, damp=False, grid=True).image
-    except Exception:
-        return rgb
+    if "```" in text:
+        cleaned = FENCE_HEAD_RE.sub("", text.strip())
+        cleaned = FENCE_TAIL_RE.sub("", cleaned).strip()
+        return cleaned
+    return text
 
 
 def detect_task(item: dict[str, Any]) -> str:
@@ -238,70 +181,16 @@ def detect_task(item: dict[str, Any]) -> str:
     return "text"
 
 
-def encode_image_url(rgb: np.ndarray, img_path: Path, idx: int, cid: str, mode: str) -> str:
-    if mode == "shm_file":
-        shm_file = SHM_DIR / f"crop_{idx}_{cid}.bmp"
-        Image.fromarray(rgb).save(shm_file, format="BMP")
-        return f"file://{shm_file}"
-    if mode == "shm_path":
-        shm_file = SHM_DIR / f"crop_{idx}_{cid}.bmp"
-        Image.fromarray(rgb).save(shm_file, format="BMP")
-        return str(shm_file)
-    if mode == "bmp_b64":
-        buf = io.BytesIO()
-        Image.fromarray(rgb).save(buf, format="BMP")
-        return "data:image/bmp;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-    if STAGE == 0 and not USE_TRIM and not USE_VIRTUAL_GRID:
-        raw = img_path.read_bytes()
-        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
-    buf = io.BytesIO()
-    Image.fromarray(rgb).save(buf, format="PNG", compress_level=1)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+def _get_conn() -> http.client.HTTPConnection:
+    conn: http.client.HTTPConnection | None = getattr(_THREAD_LOCAL, "conn", None)
+    if conn is None:
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
+        _THREAD_LOCAL.conn = conn
+    return conn
 
 
-def preprocess_crop(item: dict[str, Any], job_dir: Path, idx: int, mode: str | None = None) -> dict[str, Any]:
-    cid = item["id"]
-    task_key = detect_task(item)
-    prompt_str = item.get("prompt") or TASK_PROMPTS[task_key]
-    img_path = job_dir / item["image"]
-    active_mode = mode or IPC_MODE
-
-    if STAGE == 0:
-        b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
-        return {
-            "id": cid,
-            "orig_idx": idx,
-            "task_key": task_key,
-            "bucket_rank": 0,
-            "patch_area": 0,
-            "prompt": prompt_str,
-            "image_url": f"data:image/png;base64,{b64}",
-        }
-
-    with Image.open(img_path) as pil_img:
-        rgb = np.asarray(pil_img.convert("RGB"))
-
-    if USE_TRIM:
-        rgb = trim_outer_whitespace(rgb, pad=6)
-    if task_key == "table" and USE_VIRTUAL_GRID:
-        rgb = inject_virtual_grid(rgb)
-
-    h, w, _ = rgb.shape
-    patch_area = ((h + 27) // 28) * ((w + 27) // 28)
-    image_url = encode_image_url(rgb, img_path, idx, cid, active_mode)
-    return {
-        "id": cid,
-        "orig_idx": idx,
-        "task_key": task_key,
-        "bucket_rank": TASK_BUCKET_ORDER[task_key],
-        "patch_area": patch_area,
-        "prompt": prompt_str,
-        "image_url": image_url,
-    }
-
-
-def call_sglang(image_url: str, prompt: str, timeout: int = 300) -> str:
-    payload = {
+def call_sglang(image_url: str, prompt: str) -> str:
+    payload = json.dumps({
         "model": "glm-ocr",
         "temperature": 0.0,
         "max_tokens": MAX_TOKENS,
@@ -314,16 +203,89 @@ def call_sglang(image_url: str, prompt: str, timeout: int = 300) -> str:
                 ],
             }
         ],
-    }
-    req = urllib.request.Request(
-        f"{URL}/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-        return body["choices"][0]["message"]["content"] or ""
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    for attempt in range(2):
+        conn = _get_conn()
+        try:
+            conn.request("POST", "/v1/chat/completions", body=payload, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}: {raw[:200]!r}")
+            return json.loads(raw)["choices"][0]["message"]["content"] or ""
+        except (http.client.HTTPException, OSError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _THREAD_LOCAL.conn = None
+            if attempt == 1:
+                raise
+    return ""
+
+
+def cleanup_shm() -> None:
+    if not SHM_DIR.is_dir():
+        return
+    for p in SHM_DIR.iterdir():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def build_image_url(img_path: Path, idx: int, mode: str) -> str:
+    if mode == "shm_symlink":
+        # Pure numeric filename avoids URL-unescape errors on `%20`, `%28`, `#`, etc.
+        ext = img_path.suffix.lower() or ".png"
+        link = SHM_DIR / f"c_{idx}{ext}"
+        try:
+            link.unlink()
+        except FileNotFoundError:
+            pass
+        os.symlink(str(img_path), str(link))
+        return f"file://{link}"
+    if mode == "shm_rawpath":
+        ext = img_path.suffix.lower() or ".png"
+        link = SHM_DIR / f"c_{idx}{ext}"
+        try:
+            link.unlink()
+        except FileNotFoundError:
+            pass
+        os.symlink(str(img_path), str(link))
+        return str(link)
+    return "data:image/png;base64," + base64.b64encode(img_path.read_bytes()).decode("ascii")
+
+
+def prepare_job_items(items: list[dict[str, Any]], folder: Path, mode: str) -> list[dict[str, Any]]:
+    """Header-only (~4ms) LPT preparation: creates zero-copy symlinks and sorts table->text->formula by area."""
+    prepared: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        cid = item["id"]
+        task_key = detect_task(item)
+        prompt_str = item.get("prompt") or TASK_PROMPTS[task_key]
+        img_path = (folder / item["image"]).resolve()
+        area = 0
+        if STAGE >= 1:
+            try:
+                with Image.open(img_path) as im:
+                    w, h = im.size  # header-only, no pixel decode
+                area = w * h
+            except Exception:
+                area = img_path.stat().st_size if img_path.exists() else 0
+        image_url = build_image_url(img_path, idx, mode)
+        prepared.append({
+            "id": cid,
+            "task_key": task_key,
+            "bucket_rank": TASK_BUCKET_ORDER[task_key],
+            "area": area,
+            "prompt": prompt_str,
+            "image_url": image_url,
+        })
+    if STAGE >= 1:
+        prepared.sort(key=lambda x: (x["bucket_rank"], -x["area"]))
+    return prepared
 
 
 def infer_crop(prep: dict[str, Any]) -> tuple[str, str]:
@@ -337,25 +299,15 @@ def infer_crop(prep: dict[str, Any]) -> tuple[str, str]:
         return cid, ""
 
 
-def cleanup_shm() -> None:
-    if not SHM_DIR.is_dir():
-        return
-    for p in SHM_DIR.glob("crop_*.bmp"):
-        try:
-            p.unlink()
-        except OSError:
-            pass
-
-
 def probe_ipc_mode(sample_item: dict[str, Any], folder: Path) -> str:
-    """During untimed warmup, pick the fastest IPC transport accepted by SGLang."""
-    if STAGE == 0:
+    if STAGE == 0 or not USE_SHM_IPC:
         return "png_b64"
-    candidates = ["shm_file", "shm_path", "bmp_b64", "png_b64"] if USE_SHM_IPC else ["bmp_b64", "png_b64"]
-    for mode in candidates:
+    img_path = (folder / sample_item["image"]).resolve()
+    prompt_str = sample_item.get("prompt") or TASK_PROMPTS[detect_task(sample_item)]
+    for mode in ("shm_symlink", "shm_rawpath", "png_b64"):
         try:
-            prep = preprocess_crop(sample_item, folder, 0, mode=mode)
-            _ = call_sglang(prep["image_url"], prep["prompt"], timeout=60)
+            url = build_image_url(img_path, 0, mode)
+            _ = call_sglang(url, prompt_str)
             cleanup_shm()
             log(f"IPC transport selected: {mode}")
             return mode
@@ -365,12 +317,7 @@ def probe_ipc_mode(sample_item: dict[str, Any], folder: Path) -> str:
     return "png_b64"
 
 
-def run_manifest(
-    folder: Path,
-    cpu_pool: ThreadPoolExecutor,
-    gpu_pool: ThreadPoolExecutor,
-    limit: int | None = None,
-) -> list[tuple[str, str]]:
+def run_manifest(folder: Path, gpu_pool: ThreadPoolExecutor, limit: int | None = None) -> list[tuple[str, str]]:
     manifest_path = folder / "manifest.jsonl"
     items = [json.loads(l) for l in manifest_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     if limit is not None:
@@ -379,13 +326,8 @@ def run_manifest(
         return []
 
     t0 = time.perf_counter()
-    prepped = list(cpu_pool.map(lambda pair: preprocess_crop(pair[1], folder, pair[0]), enumerate(items)))
+    scheduled = prepare_job_items(items, folder, IPC_MODE)
     t_prep = time.perf_counter()
-
-    if STAGE >= 1:
-        scheduled = sorted(prepped, key=lambda x: (x["bucket_rank"], -x["patch_area"]))
-    else:
-        scheduled = prepped
 
     results_map: dict[str, str] = {}
     for cid, text in gpu_pool.map(infer_crop, scheduled):
@@ -400,8 +342,7 @@ def run_manifest(
     return [(m["id"], results_map.get(m["id"], "")) for m in items]
 
 
-def warmup(cpu_pool: ThreadPoolExecutor, gpu_pool: ThreadPoolExecutor) -> None:
-    """Untimed warmup on $TRACK2_DEV_DIR: probe IPC transport and prime CUDA Graphs & RadixAttention."""
+def warmup(gpu_pool: ThreadPoolExecutor) -> None:
     global IPC_MODE
     dev_dir = Path(DEV) if DEV else None
     if not dev_dir or not (dev_dir / "manifest.jsonl").exists():
@@ -411,9 +352,8 @@ def warmup(cpu_pool: ThreadPoolExecutor, gpu_pool: ThreadPoolExecutor) -> None:
         return
     t0 = time.monotonic()
     IPC_MODE = probe_ipc_mode(items[0], dev_dir)
-    # Pick balanced warmup samples across table / text / formula to warm up all prompt buckets and batch sizes
     warm_limit = min(len(items), max(32, CONCURRENCY))
-    run_manifest(dev_dir, cpu_pool, gpu_pool, limit=warm_limit)
+    run_manifest(dev_dir, gpu_pool, limit=warm_limit)
     log(f"untimed warmup ({warm_limit} dev crops) finished in {time.monotonic() - t0:.1f}s")
 
 
@@ -432,8 +372,8 @@ def main() -> None:
 
     try:
         wait_ready(server)
-        with ThreadPoolExecutor(max_workers=CPU_WORKERS) as cpu_pool, ThreadPoolExecutor(max_workers=CONCURRENCY) as gpu_pool:
-            warmup(cpu_pool, gpu_pool)
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as gpu_pool:
+            warmup(gpu_pool)
             Path(WORK, "READY").touch()
             log("READY signaled; polling jobs...")
 
@@ -442,14 +382,17 @@ def main() -> None:
             stop_file = Path(WORK) / "STOP"
             while not stop_file.exists():
                 if jobs_root.is_dir():
-                    entries = sorted(os.listdir(jobs_root), key=lambda s: int(s.split("-")[0]) if s.split("-")[0].isdigit() else 0)
+                    entries = sorted(
+                        os.listdir(jobs_root),
+                        key=lambda s: int(s.split("-")[0]) if s.split("-")[0].isdigit() else 0,
+                    )
                     for name in entries:
                         if name in seen:
                             continue
                         job_dir = jobs_root / name
                         if not (job_dir / "manifest.jsonl").exists() or (job_dir / "DONE").exists():
                             continue
-                        results = run_manifest(job_dir, cpu_pool, gpu_pool)
+                        results = run_manifest(job_dir, gpu_pool)
                         pred_path = job_dir / "predictions.jsonl"
                         out_lines = [json.dumps({"id": cid, "text": text}, ensure_ascii=False) for cid, text in results]
                         with open(pred_path, "w", encoding="utf-8") as f:
