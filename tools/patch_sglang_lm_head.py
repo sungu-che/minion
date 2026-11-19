@@ -112,9 +112,10 @@ def _t2_get_lm_head_cache(lm_head, vocab_size: int):
             and logits_metadata.forward_mode.is_target_verify()
             and not logits_metadata.return_logprob
             and logits_metadata.capture_hidden_mode == CaptureHiddenMode.NULL
-            and self.attn_tp_size == 1
+            and getattr(self, "attn_tp_size", 1) == 1
+            and getattr(lm_head, "tp_size", 1) == 1
             and self.logit_scale is None
-            and not self.final_logit_softcapping
+            and not getattr(self, "final_logit_softcapping", None)
             and not self.do_tensor_parallel_all_gather
             and not self.do_tensor_parallel_all_gather_dp_attn
             and hidden_states.dtype == torch.bfloat16

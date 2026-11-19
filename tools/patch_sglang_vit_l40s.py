@@ -39,14 +39,13 @@ def patch_vision_py(src: str) -> str:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)"""
-    repl_attn = """        # [TRACK2-K2-VIS-QKV-CUDA] Fused BF16 QKV split + Q/K RMSNorm + 2D NeoX RoPE -> [1, H, S, 64] SDPA
+    repl_attn = """        # [TRACK2-K2-VIS-QKV-CUDA] Fused BF16 QKV split + Q/K RMSNorm + 2D NeoX RoPE -> SDPA (1-img) or Triton (multi-img)
         if (
             self.use_qkv_parallel
             and self.qk_normalization_by_head_size
             and self.head_size == 64
             and bsz == 1
             and isinstance(cu_seqlens, list)
-            and cu_seqlens[0].numel() == 2
             and rotary_pos_emb_cos is not None
             and rotary_pos_emb_sin is not None
             and rotary_pos_emb_cos.size(-1) == 64
@@ -61,23 +60,49 @@ def patch_vision_py(src: str) -> str:
                     _k2_fn = _t2_cuda.vis_qkv_sdpa_bf16 if _t2_cuda.available() else False
                     if _k2_fn and not getattr(VisionAttention, "_track2_k2_logged", False):
                         VisionAttention._track2_k2_logged = True
-                        print("[track2-k2-vis-qkv] ON: fused BF16 CUDA sm_89 QKV+RMSNorm+RoPE->SDPA", flush=True)
+                        print("[track2-k2-vis-qkv] ON: fused BF16 CUDA sm_89 QKV+RMSNorm+RoPE (single+multi)", flush=True)
                 except Exception:
                     _k2_fn = False
                 self._track2_vis_qkv_fn = _k2_fn
             if _k2_fn:
                 qkv, _ = self.qkv_proj(x)
-                q4, k4, v4 = _k2_fn(
-                    qkv,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    rotary_pos_emb_cos,
-                    rotary_pos_emb_sin,
-                    float(self.q_norm.variance_epsilon),
-                    head,
-                )
-                out4 = F.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
-                output = out4.squeeze(0).transpose(0, 1).reshape(1, s, head * 64)
+                if cu_seqlens[0].numel() == 2:
+                    q4, k4, v4 = _k2_fn(
+                        qkv,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        rotary_pos_emb_cos,
+                        rotary_pos_emb_sin,
+                        float(self.q_norm.variance_epsilon),
+                        head,
+                        False,
+                    )
+                    out4 = F.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+                    output = out4.squeeze(0).transpose(0, 1).reshape(1, s, head * 64)
+                else:
+                    q3, k3, v3 = _k2_fn(
+                        qkv,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        rotary_pos_emb_cos,
+                        rotary_pos_emb_sin,
+                        float(self.q_norm.variance_epsilon),
+                        head,
+                        True,
+                    )
+                    out3 = self.qkv_backend.forward(
+                        q=q3,
+                        k=k3,
+                        v=v3,
+                        bsz=bsz,
+                        seq_len=s,
+                        cu_seqlens=cu_seqlens,
+                        attention_mask=attention_mask,
+                        sequence_lengths=sequence_lengths,
+                        max_seqlen=max_seqlen,
+                        output_ws=attn_output_ws,
+                    )
+                    output = out3.reshape(1, s, head * 64)
                 output, _ = self.proj(output)
                 return output
 

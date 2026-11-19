@@ -47,6 +47,59 @@ gk_u8_norm_bf16_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
+// 1B. gk_raw_rgb_patchify_norm_bf16: Raw HWC uint8 RGB [gh*14, gw*14, 3] (passed as [gh*gw, 588] uint8)
+//     -> 2x2 merge-group ordered + normalized [gh*gw, 588] __nv_bfloat16 in ONE GPU pass!
+//     Eliminates CPU patchify, eliminates CPU float->bf16, cuts ZMQ IPC & PCIe H2D by 4x (216MB vs 865MB),
+//     and feeds 2x smaller folded GlmOcrVisionPatchEmbed F.linear(x, W0 + W1, bias).
+// ---------------------------------------------------------------------------------------------
+__global__ void __launch_bounds__(256)
+gk_raw_rgb_patchify_norm_bf16_kernel(
+    const uint8_t* __restrict__ rgb_hwc,
+    __nv_bfloat16* __restrict__ dst_patches,
+    int gh,
+    int gw,
+    float s0, float b0,
+    float s1, float b1,
+    float s2, float b2
+) {
+    const int n_patches = gh * gw;
+    const int64_t total = (int64_t)n_patches * 588;
+    const int gw2 = gw >> 1;
+    const int w_px = gw * 14;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+
+    for (int64_t t = idx; t < total; t += stride) {
+        const int p = (int)(t / 588);
+        const int col = (int)(t % 588);
+
+        const int group_idx = p >> 2;
+        const int sub_idx = p & 3;
+        const int gr = group_idx / gw2;
+        const int gc = group_idx % gw2;
+        const int pr = (gr << 1) + (sub_idx >> 1);
+        const int pc = (gc << 1) + (sub_idx & 1);
+
+        int c, rem;
+        float sc, bi;
+        if (col < 196) {
+            c = 0; rem = col; sc = s0; bi = b0;
+        } else if (col < 392) {
+            c = 1; rem = col - 196; sc = s1; bi = b1;
+        } else {
+            c = 2; rem = col - 392; sc = s2; bi = b2;
+        }
+        const int py = rem / 14;
+        const int px = rem % 14;
+
+        const int y = pr * 14 + py;
+        const int x = pc * 14 + px;
+        const uint8_t v = rgb_hwc[((int64_t)y * w_px + x) * 3 + c];
+        dst_patches[t] = __float2bfloat16_rn(fmaf((float)v, sc, bi));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // 2. gk_vis_qkv_sdpa_bf16: Fused 9-in-1 CogViT Attention Prep (Upgraded from gravity.hip gk_vis_qkv)
 //    Input:
 //      qkv [S, 3, H, 64] (__nv_bfloat16)  (H=16, D=64, total last dim=3072)
@@ -64,7 +117,7 @@ gk_u8_norm_bf16_kernel(
 //      Lane d (0..31) owns BOTH (d, d+32) in registers: exact NeoX rotation pair!
 //      RMSNorm sum-of-squares uses 5-step warp __shfl_xor_sync reduction.
 // ---------------------------------------------------------------------------------------------
-template <bool COS_BF16>
+template <bool COS_BF16, bool OUT_SHD>
 __global__ void __launch_bounds__(128)
 gk_vis_qkv_sdpa_bf16_kernel(
     const __nv_bfloat16* __restrict__ qkv,
@@ -91,7 +144,9 @@ gk_vis_qkv_sdpa_bf16_kernel(
     const int s = tmp / H;
 
     const int64_t in_base = ((int64_t)s * 3 + part) * (int64_t)(H * 64) + (int64_t)h * 64;
-    const int64_t out_base = ((int64_t)h * S + s) * 64;
+    const int64_t out_base = OUT_SHD
+        ? (((int64_t)s * H + h) * 64)
+        : (((int64_t)h * S + s) * 64);
 
     const __nv_bfloat16 b0 = qkv[in_base + lane];
     const __nv_bfloat16 b1 = qkv[in_base + lane + 32];
@@ -328,6 +383,30 @@ int track2_u8_norm_bf16(
     return (int)cudaGetLastError();
 }
 
+int track2_raw_rgb_patchify_norm_bf16(
+    const void* rgb_hwc_u8,
+    void* dst_patches_bf16,
+    int gh,
+    int gw,
+    float s0, float b0,
+    float s1, float b1,
+    float s2, float b2,
+    void* stream_ptr
+) {
+    const int n_patches = gh * gw;
+    if (n_patches <= 0) return 0;
+    const int64_t total = (int64_t)n_patches * 588;
+    const int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    if (blocks > 65535) blocks = 65535;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    gk_raw_rgb_patchify_norm_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        (const uint8_t*)rgb_hwc_u8, (__nv_bfloat16*)dst_patches_bf16,
+        gh, gw, s0, b0, s1, b1, s2, b2
+    );
+    return (int)cudaGetLastError();
+}
+
 int track2_vis_qkv_sdpa_bf16(
     const void* qkv_bf16,
     const void* qn_bf16,
@@ -335,6 +414,7 @@ int track2_vis_qkv_sdpa_bf16(
     const void* cos_ptr,
     const void* sin_ptr,
     int cos_is_bf16,
+    int out_shd,
     float eps,
     void* q_out_bf16,
     void* k_out_bf16,
@@ -348,27 +428,33 @@ int track2_vis_qkv_sdpa_bf16(
     const int blocks = (total_warps + 3) / 4;
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     if (cos_is_bf16) {
-        gk_vis_qkv_sdpa_bf16_kernel<true><<<blocks, 128, 0, stream>>>(
-            (const __nv_bfloat16*)qkv_bf16,
-            (const __nv_bfloat16*)qn_bf16,
-            (const __nv_bfloat16*)kn_bf16,
-            cos_ptr, sin_ptr, eps,
-            (__nv_bfloat16*)q_out_bf16,
-            (__nv_bfloat16*)k_out_bf16,
-            (__nv_bfloat16*)v_out_bf16,
-            S, H
-        );
+        if (out_shd) {
+            gk_vis_qkv_sdpa_bf16_kernel<true, true><<<blocks, 128, 0, stream>>>(
+                (const __nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16,
+                cos_ptr, sin_ptr, eps,
+                (__nv_bfloat16*)q_out_bf16, (__nv_bfloat16*)k_out_bf16, (__nv_bfloat16*)v_out_bf16, S, H
+            );
+        } else {
+            gk_vis_qkv_sdpa_bf16_kernel<true, false><<<blocks, 128, 0, stream>>>(
+                (const __nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16,
+                cos_ptr, sin_ptr, eps,
+                (__nv_bfloat16*)q_out_bf16, (__nv_bfloat16*)k_out_bf16, (__nv_bfloat16*)v_out_bf16, S, H
+            );
+        }
     } else {
-        gk_vis_qkv_sdpa_bf16_kernel<false><<<blocks, 128, 0, stream>>>(
-            (const __nv_bfloat16*)qkv_bf16,
-            (const __nv_bfloat16*)qn_bf16,
-            (const __nv_bfloat16*)kn_bf16,
-            cos_ptr, sin_ptr, eps,
-            (__nv_bfloat16*)q_out_bf16,
-            (__nv_bfloat16*)k_out_bf16,
-            (__nv_bfloat16*)v_out_bf16,
-            S, H
-        );
+        if (out_shd) {
+            gk_vis_qkv_sdpa_bf16_kernel<false, true><<<blocks, 128, 0, stream>>>(
+                (const __nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16,
+                cos_ptr, sin_ptr, eps,
+                (__nv_bfloat16*)q_out_bf16, (__nv_bfloat16*)k_out_bf16, (__nv_bfloat16*)v_out_bf16, S, H
+            );
+        } else {
+            gk_vis_qkv_sdpa_bf16_kernel<false, false><<<blocks, 128, 0, stream>>>(
+                (const __nv_bfloat16*)qkv_bf16, (const __nv_bfloat16*)qn_bf16, (const __nv_bfloat16*)kn_bf16,
+                cos_ptr, sin_ptr, eps,
+                (__nv_bfloat16*)q_out_bf16, (__nv_bfloat16*)k_out_bf16, (__nv_bfloat16*)v_out_bf16, S, H
+            );
+        }
     }
     return (int)cudaGetLastError();
 }

@@ -57,12 +57,28 @@ def load() -> Optional[ctypes.CDLL]:
         ]
         lib.track2_u8_norm_bf16.restype = ctypes.c_int
 
+        lib.track2_raw_rgb_patchify_norm_bf16.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_void_p,
+        ]
+        lib.track2_raw_rgb_patchify_norm_bf16.restype = ctypes.c_int
+
         lib.track2_vis_qkv_sdpa_bf16.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
+            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_float,
             ctypes.c_void_p,
@@ -125,6 +141,35 @@ def u8_norm_bf16(x_u8: torch.Tensor, out: Optional[torch.Tensor] = None) -> torc
     return out
 
 
+def raw_rgb_patchify_norm_bf16(
+    rgb_u8: torch.Tensor,
+    gh: int,
+    gw: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused GPU 2x2 merge-group patchify + normalize from raw HWC uint8 RGB into `[gh*gw, 588]` BF16."""
+    lib = load()
+    assert lib is not None
+    rgb_c = rgb_u8.contiguous()
+    n = int(gh * gw)
+    if out is None:
+        out = torch.empty((n, 588), dtype=torch.bfloat16, device=rgb_c.device)
+    stream = torch.cuda.current_stream(rgb_c.device).cuda_stream
+    err = lib.track2_raw_rgb_patchify_norm_bf16(
+        rgb_c.data_ptr(),
+        out.data_ptr(),
+        int(gh),
+        int(gw),
+        _SCALE[0], _BIAS[0],
+        _SCALE[1], _BIAS[1],
+        _SCALE[2], _BIAS[2],
+        stream,
+    )
+    if err != 0:
+        raise RuntimeError(f"track2_raw_rgb_patchify_norm_bf16 CUDA error {err}")
+    return out
+
+
 def vis_qkv_sdpa_bf16(
     qkv: torch.Tensor,
     qn_weight: torch.Tensor,
@@ -133,16 +178,18 @@ def vis_qkv_sdpa_bf16(
     sin: torch.Tensor,
     eps: float,
     num_heads: int = 16,
+    out_shd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused QKV split + Q/K head RMSNorm + NeoX 2D RoPE -> contiguous `[1, H, S, 64]` SDPA tensors."""
+    """Fused QKV split + Q/K head RMSNorm + NeoX 2D RoPE -> `[1, H, S, 64]` (SDPA) or `[S, H, 64]` (Triton)."""
     lib = load()
     assert lib is not None
     qkv_c = qkv.contiguous()
     s = int(qkv_c.numel() // (3 * num_heads * 64))
     dev = qkv_c.device
-    q_out = torch.empty((1, num_heads, s, 64), dtype=torch.bfloat16, device=dev)
-    k_out = torch.empty((1, num_heads, s, 64), dtype=torch.bfloat16, device=dev)
-    v_out = torch.empty((1, num_heads, s, 64), dtype=torch.bfloat16, device=dev)
+    shape = (s, num_heads, 64) if out_shd else (1, num_heads, s, 64)
+    q_out = torch.empty(shape, dtype=torch.bfloat16, device=dev)
+    k_out = torch.empty(shape, dtype=torch.bfloat16, device=dev)
+    v_out = torch.empty(shape, dtype=torch.bfloat16, device=dev)
     cos_c = cos.contiguous()
     sin_c = sin.contiguous()
     cos_is_bf16 = 1 if cos_c.dtype == torch.bfloat16 else 0
@@ -157,6 +204,7 @@ def vis_qkv_sdpa_bf16(
         cos_c.data_ptr(),
         sin_c.data_ptr(),
         cos_is_bf16,
+        1 if out_shd else 0,
         float(eps),
         q_out.data_ptr(),
         k_out.data_ptr(),
