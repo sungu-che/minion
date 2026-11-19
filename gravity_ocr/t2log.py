@@ -197,6 +197,16 @@ class _SchedLayer:
 
         commit = sum(r.get("commit", 0) for r in dec)
         req_rounds = sum(r["bs"] for r in dec)
+        alloc = {}
+        try:  # CUDA caching-allocator stalls (free-all + retry, fresh cudaMalloc) during the job: deltas since last job
+            import torch
+            ms = torch.cuda.memory_stats()
+            cur = {k: int(ms.get(k, 0)) for k in ("num_alloc_retries", "num_device_alloc", "num_device_free", "num_ooms")}
+            prev = getattr(self, "_alloc_prev", None) or {k: 0 for k in cur}
+            alloc = {k.replace("num_", ""): cur[k] - prev[k] for k in cur}
+            self._alloc_prev = cur
+        except Exception:
+            pass
         emit("L3", {
             "t_first": round(self.t_first, 4), "t_last": round(self.t_last, 4),
             "span_s": round(self.t_last - self.t_first, 4), "iterations": len(its),
@@ -210,6 +220,7 @@ class _SchedLayer:
             "gap_ms_p50_p90_max": [None if v is None else round(1e3 * v, 1) for v in q(gaps, 0.5, 0.9, 1.0)],
             "finished": sum(r.get("fin", 0) for r in dec) + sum(r.get("fin", 0) for r in ext),
             **({"commit_hist": dict(sorted(self.commit_hist.items()))} if self.commit_hist else {}),
+            **({"cuda_alloc": alloc} if alloc else {}),
         })
         # L4: resolve the batch GPU times (events of finished batches; no synchronization)
         if self.vit_batches:
